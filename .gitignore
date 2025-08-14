@@ -1,0 +1,16 @@
+# Logs
+logs/
+**/logs/
+
+# Secrets（絶対コミットしないもの）
+password.txt
+*.secret.txt
+*.pwd
+*.pw
+*.cred_*
+
+# OS/エディタの一時ファイル
+Thumbs.db
+.DS_Store
+*.bak
+*.tmp
