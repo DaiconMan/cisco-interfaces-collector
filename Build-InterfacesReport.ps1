@@ -1,12 +1,14 @@
 # Build-InterfacesReport.ps1
-# - Scan .\logs\<host>\<IF>.txt and _errors_*.txt (from Get-CiscoInterfaces-PerIF.ps1)
-# - Output a single HTML report with performance signals (5min bps/pps, utilization, errors)
+# - Scan .\logs\<hostIP>\<IF>.txt and _errors_*.txt (from Get-CiscoInterfaces-PerIF.ps1)
+# - Output a single HTML report with performance signals (5min/seconds bps/pps, utilization, errors)
 # - PowerShell 5.1 compatible (no "??", no negative index), no external modules
+# - hosts.txt (IP,DisplayName) を読み取り、"Host" 列には表示名、"IP" 列を別途出力
 
 # ---------- simple arg parser ----------
 $opt = @{
   LogsRoot          = $null
   OutFile           = $null
+  HostsFile         = $null
   TopN              = 10
   ZeroBpsForUnused  = 0
   UtilWarnPct       = 70
@@ -21,6 +23,7 @@ for ($i=0; $i -lt $args.Count; $i++) {
     switch ($k) {
       'logsroot'         { $i++; $opt.LogsRoot   = $args[$i]; break }
       'outfile'          { $i++; $opt.OutFile    = $args[$i]; break }
+      'hostsfile'        { $i++; $opt.HostsFile  = $args[$i]; break }
       'topn'             { $i++; $opt.TopN       = [int]$args[$i]; break }
       'unusedthreshold'  { $i++; $opt.ZeroBpsForUnused = [int]$args[$i]; break }
       'utilwarnpct'      { $i++; $opt.UtilWarnPct   = [int]$args[$i]; break }
@@ -43,6 +46,11 @@ function Get-BaseDir {
 $Base = Get-BaseDir
 if (-not $opt.LogsRoot -or $opt.LogsRoot -eq '') { $opt.LogsRoot = Join-Path $Base 'logs' }
 if (-not $opt.OutFile  -or $opt.OutFile  -eq '') { $opt.OutFile  = Join-Path $Base 'interfaces_report.html' }
+if (-not $opt.HostsFile -or $opt.HostsFile -eq '') {
+  # カレント直下の hosts.txt があれば既定に
+  $cand = Join-Path $Base 'hosts.txt'
+  if (Test-Path -LiteralPath $cand) { $opt.HostsFile = $cand }
+}
 
 function Resolve-Lit([string]$p){
   if (-not $p) { return $null }
@@ -56,8 +64,31 @@ function Resolve-Lit([string]$p){
 }
 $LogsRoot = Resolve-Lit $opt.LogsRoot
 $OutFile  = Resolve-Lit $opt.OutFile
+$HostsFile = Resolve-Lit $opt.HostsFile
 
 if (-not (Test-Path -LiteralPath $LogsRoot)) { throw "LogsRoot not found: $LogsRoot" }
+
+# ---------- hosts map (IP => DisplayName) ----------
+$HostNameMap = @{}
+if ($HostsFile -and (Test-Path -LiteralPath $HostsFile)) {
+  try {
+    $lines = Get-Content -LiteralPath $HostsFile -ErrorAction Stop
+    foreach($ln in $lines){
+      $t = ($ln -replace '^\s+|\s+$','')
+      if ($t -eq '' -or $t -match '^\s*#') { continue }
+      $parts = $t.Split(',',2)
+      $ip = $parts[0].Trim()
+      $disp = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+      if ($ip -ne '') {
+        if ($disp -eq '') { $disp = $ip }
+        $HostNameMap[$ip] = $disp
+      }
+    }
+    Write-Info "Hosts map loaded: $($HostNameMap.Count) entries"
+  } catch {
+    Write-Warning "hosts map read failed: $($_.Exception.Message)"
+  }
+}
 
 # ---------- regex helpers ----------
 $HeaderRx = [regex]'(?m)^===== (?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [\+\-]\d{2}:\d{2}) =====\r?\n# host:\s*(?<host>.+?)\s+port:\s*(?<port>\d+)\r?\n# command:\s*show interfaces (?<if>.+?)\r?\n'
@@ -119,15 +150,35 @@ function Html-Escape([string]$s){
   }
 }
 
+function Is-IPv4([string]$x){
+  return [bool]([regex]::IsMatch($x,'^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$'))
+}
+
 # ---------- parse a single interface file ----------
 function Parse-InterfaceFile([string]$path){
   $text = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
   $h = $HeaderRx.Matches($text)
   if ($h.Count -eq 0) { return $null }
 
-  $HostName = $h[0].Groups['host'].Value
-  $ifn      = $h[0].Groups['if'].Value
-  $port     = [int]$h[0].Groups['port'].Value
+  $HostToken = $h[0].Groups['host'].Value
+  $ifn       = $h[0].Groups['if'].Value
+  $port      = [int]$h[0].Groups['port'].Value
+
+  # IPの判定：ヘッダのhostがIPv4ならそれを、違う場合はフォルダ名（直上）がIPv4ならそれを採用
+  $ip = $null
+  if (Is-IPv4 $HostToken) { $ip = $HostToken }
+  else {
+    $parent = Split-Path -Parent $path | Split-Path -Leaf
+    if (Is-IPv4 $parent) { $ip = $parent }
+  }
+  if (-not $ip) { $ip = $HostToken } # IPv4でないが、表示用に fallback
+
+  # 表示名の決定：hosts.txt にあればそれ、無ければIPまたは HostToken
+  $display = $null
+  if ($HostNameMap.ContainsKey($ip)) { $display = $HostNameMap[$ip] }
+  else {
+    if (Is-IPv4 $ip) { $display = $ip } else { $display = $HostToken }
+  }
 
   $blocks = @()
   $lastBwBps = $null
@@ -195,7 +246,9 @@ function Parse-InterfaceFile([string]$path){
 
   [pscustomobject]@{
     FilePath      = $path
-    Host          = $HostName
+    Host          = $display     # ★ 表示名（テーブル表示用）
+    IP            = $ip          # ★ IP列（明示表示用）
+    HostToken     = $HostToken   # 参考（解析に未使用）
     Interface     = $ifn
     Port          = $port
     Captures      = $blocks.Count
@@ -242,14 +295,21 @@ foreach ($f in $ifFiles) {
 $errFiles = Get-ChildItem -LiteralPath $LogsRoot -Recurse -File -Filter '_errors_*.txt'
 $errRows = @()
 foreach ($ef in $errFiles) {
-  $HostName = Split-Path -Parent $ef.FullName | Split-Path -Leaf
+  $folder = Split-Path -Parent $ef.FullName | Split-Path -Leaf
+  $ip = $folder
+  if (-not (Is-IPv4 $ip)) {
+    # フォルダ名がIPでない場合は hosts map から逆引き不可。IP列はそのまま表示。
+    $ip = $folder
+  }
+  $disp = if ($HostNameMap.ContainsKey($ip)) { $HostNameMap[$ip] } else { $ip }
+
   $lines = Get-Content -LiteralPath $ef.FullName -ErrorAction SilentlyContinue
   $count = ($lines | Where-Object { $_ -match '\S' }).Count
   $last  = ($lines | Select-Object -Last 1)
   $ymd = [regex]::Match($ef.Name, '_errors_(\d{8})\.txt')
   $dateStr = if ($ymd.Success) { [datetime]::ParseExact($ymd.Groups[1].Value,'yyyyMMdd',$null).ToString('yyyy-MM-dd') } else { '' }
   $errRows += [pscustomobject]@{
-    Host = $HostName; Date=$dateStr; Lines=$count; LastLine=$last; FilePath=$ef.FullName
+    Host = $disp; IP=$ip; Date=$dateStr; Lines=$count; LastLine=$last; FilePath=$ef.FullName
   }
 }
 
@@ -296,22 +356,27 @@ $byPps = $ifs | ForEach-Object {
   $_ | Add-Member -PassThru NoteProperty Peak_pps $p
 } | Sort-Object Peak_pps -Descending
 
-# host scorecards
-$byHost = $ifs | Group-Object Host | ForEach-Object {
+# device scorecards: IP単位で集計し、表示は DisplayName + IP
+$byDevice = $ifs | Group-Object IP | ForEach-Object {
   $g = $_.Group
+  $ip = $_.Name
+  $disp = ($g | Select-Object -First 1).Host
   [pscustomobject]@{
-    Host = $_.Name
+    Host = $disp
+    IP   = $ip
     IFs  = $g.Count
     Up   = ($g | Where-Object { $_.LastOper -eq 'up' }).Count
     Down = ($g | Where-Object { $_.LastOper -eq 'down' -and -not $_.LastAdminDown }).Count
     AdminDown = ($g | Where-Object { $_.LastAdminDown }).Count
   }
-} | Sort-Object Host
+} | Sort-Object Host, IP
 
-# error summary per host
-$errByHost = $errRows | Group-Object Host | ForEach-Object {
+# error summary per device (IP)
+$errByDevice = $errRows | Group-Object IP | ForEach-Object {
+  $disp = ($_.Group | Select-Object -First 1).Host
   [pscustomobject]@{
-    Host = $_.Name
+    Host = $disp
+    IP   = $_.Name
     Files = $_.Count
     Lines = ($_.Group | Measure-Object -Property Lines -Sum).Sum
     LastDate = ($_.Group | Sort-Object Date | Select-Object -Last 1).Date
@@ -326,7 +391,7 @@ h2{margin:24px 0 4px 0}
 .small{color:#666;font-size:12px}
 .desc{color:#555;font-size:12px;margin:0 0 8px 0}
 .kpi{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap}
-.card{border:1px solid #e5e5e5;border-radius:8px;padding:12px;min-width:180px}
+.card{border:1px solid #e5e5e5;border-radius:8px;padding:12px;min-width:200px}
 .card .title{font-weight:600}
 .card .desc{margin:4px 0 6px 0}
 .card .num{font-size:22px;font-weight:700}
@@ -345,6 +410,7 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("<style>$css</style></head><body>")
 [void]$sb.AppendLine("<h1>Cisco Interfaces Report</h1><div class='small'>Generated: $($now.ToString('yyyy-MM-dd HH:mm:ss zzz'))</div>")
 [void]$sb.AppendLine("<div class='small'>Source: $(Html-Escape $LogsRoot)</div>")
+if ($HostsFile) { [void]$sb.AppendLine("<div class='small'>Hosts map: $(Html-Escape $HostsFile)</div>") }
 
 # KPIs + descriptions
 [void]$sb.AppendLine("<div class='kpi'>")
@@ -358,53 +424,53 @@ $errTotal = ($errRows | Measure-Object -Property Lines -Sum).Sum
 
 # Device scorecards
 [void]$sb.AppendLine("<h2>Device Scorecard (by Host)</h2>")
-[void]$sb.AppendLine("<div class='desc'>装置ごとのインターフェース内訳。UP/DOWN/Admin Down を装置単位で把握できます。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Total IFs</th><th>UP</th><th>DOWN</th><th>Admin Down</th></tr>")
-foreach($r in $byHost){
-  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td>$($r.IFs)</td><td class='good'>$($r.Up)</td><td class='bad'>$($r.Down)</td><td>$($r.AdminDown)</td></tr>")
+[void]$sb.AppendLine("<div class='desc'>装置ごとのインターフェース内訳。Host は表示名、IP は実アドレスです。</div>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Total IFs</th><th>UP</th><th>DOWN</th><th>Admin Down</th></tr>")
+foreach($r in $byDevice){
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td>$($r.IFs)</td><td class='good'>$($r.Up)</td><td class='bad'>$($r.Down)</td><td>$($r.AdminDown)</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
-# Utilization & PPS details (from 5 minute/seconds rate)
+# Utilization & PPS details
 $topUtil = $byUtil | Select-Object -First $opt.TopN
 [void]$sb.AppendLine("<h2>Utilization & PPS (5-minute average)</h2>")
-[void]$sb.AppendLine("<div class='desc'>show interfaces の <b>5 minute / 30 seconds input/output rate</b> から bps/pps とリンク速度を用いて利用率を算出。高い順に表示します。</div>")
-[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>Interface</th><th>In (bps / pps)</th><th>Out (bps / pps)</th><th>Util In</th><th>Util Out</th><th>Link Speed</th><th>Duplex</th><th>Last Ts</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>show interfaces の 5 minute / 30 seconds の平均から bps/pps とリンク速度を用いて利用率を算出。高い順に表示します。</div>")
+[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>IP</th><th>Interface</th><th>In (bps / pps)</th><th>Out (bps / pps)</th><th>Util In</th><th>Util Out</th><th>Link Speed</th><th>Duplex</th><th>Last Ts</th></tr>")
 $rank=0
 foreach($r in $topUtil){ $rank++
-  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape (Format-Bps $r.LastIn_bps)) / $(Html-Escape (Format-Pps $r.LastIn_pps))</td><td>$(Html-Escape (Format-Bps $r.LastOut_bps)) / $(Html-Escape (Format-Pps $r.LastOut_pps))</td><td>$(Html-Escape (Format-Pct $r.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $r.UtilOut_pct))</td><td>$(Html-Escape $r.LastSpeed)</td><td>$(Html-Escape $r.LastDuplex)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape (Format-Bps $r.LastIn_bps)) / $(Html-Escape (Format-Pps $r.LastIn_pps))</td><td>$(Html-Escape (Format-Bps $r.LastOut_bps)) / $(Html-Escape (Format-Pps $r.LastOut_pps))</td><td>$(Html-Escape (Format-Pct $r.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $r.UtilOut_pct))</td><td>$(Html-Escape $r.LastSpeed)</td><td>$(Html-Escape $r.LastDuplex)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 if (($topUtil | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='10'>しきい値の範囲では特筆すべき懸念は検出されませんでした（利用率算出にはリンク速度の取得が必要です）。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='11'>しきい値の範囲では特筆すべき懸念は検出されませんでした（利用率算出にはリンク速度の取得が必要です）。</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
 # Top busy (bps)
 $topBusy = $busiest | Select-Object -First $opt.TopN
 [void]$sb.AppendLine("<h2>Top $($opt.TopN) Busy Interfaces (by latest peak bps)</h2>")
-[void]$sb.AppendLine("<div class='desc'>直近の取得で <b>In/Out の大きい方（bps）</b>が高い順。通信量ベースの上位です。</div>")
-[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>Interface</th><th>Peak (last)</th><th>Last Timestamp</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>直近の取得で In/Out の大きい方（bps）が高い順。通信量ベースの上位です。</div>")
+[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>IP</th><th>Interface</th><th>Peak (last)</th><th>Last Ts</th></tr>")
 $rank=0
 foreach($r in $topBusy){ $rank++
   $peakFmt = Format-Bps $r.Peak_bps
-  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape $peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape $peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 if (($topBusy | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='5'>データがありません。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='6'>データがありません。</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
 # Top by PPS
 $topPps = $byPps | Select-Object -First $opt.TopN
 [void]$sb.AppendLine("<h2>Top $($opt.TopN) by PPS</h2>")
-[void]$sb.AppendLine("<div class='desc'>直近の <b>pps（パケット毎秒）</b>が多い順。小さいサイズのパケットが多い場合、CPU/中継装置に負荷が掛かる傾向があります。</div>")
-[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>Interface</th><th>Peak PPS (last)</th><th>In (pps)</th><th>Out (pps)</th><th>Last Ts</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>直近の pps（パケット毎秒）が多い順。小さいサイズのパケットが多い場合、CPU/中継装置に負荷が掛かる傾向があります。</div>")
+[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>IP</th><th>Interface</th><th>Peak PPS (last)</th><th>In (pps)</th><th>Out (pps)</th><th>Last Ts</th></tr>")
 $rank=0
 foreach($r in $topPps){ $rank++
-  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape (Format-Pps $r.Peak_pps))</td><td>$(Html-Escape (Format-Pps $r.LastIn_pps))</td><td>$(Html-Escape (Format-Pps $r.LastOut_pps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape (Format-Pps $r.Peak_pps))</td><td>$(Html-Escape (Format-Pps $r.LastIn_pps))</td><td>$(Html-Escape (Format-Pps $r.LastOut_pps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 if (($topPps | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='7'>データがありません。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='8'>データがありません。</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -428,6 +494,7 @@ foreach($x in $ifs){
   if ($reasons.Count -gt 0) {
     $concerns += [pscustomobject]@{
       Host       = $x.Host
+      IP         = $x.IP
       Interface  = $x.Interface
       UtilIn_pct = $x.UtilIn_pct
       UtilOut_pct= $x.UtilOut_pct
@@ -446,59 +513,59 @@ $concerns = $concerns | Sort-Object @{e={$_.UtilIn_pct};d=$true}, @{e={$_.UtilOu
 
 [void]$sb.AppendLine("<h2>Potential Performance Concerns</h2>")
 [void]$sb.AppendLine("<div class='desc'>高い利用率（警告≥$($opt.UtilWarnPct)%／要注意≥$($opt.UtilSeverePct)%）、高PPS（≥$($opt.PpsWarn)）や Half-duplex、フラップ、エラー/CRC/衝突 を検出します。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Util In</th><th>Util Out</th><th>Peak PPS</th><th>Duplex</th><th>InErr</th><th>OutErr</th><th>CRC</th><th>Coll</th><th>Reasons</th><th>Last Ts</th></tr>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Interface</th><th>Util In</th><th>Util Out</th><th>Peak PPS</th><th>Duplex</th><th>InErr</th><th>OutErr</th><th>CRC</th><th>Coll</th><th>Reasons</th><th>Last Ts</th></tr>")
 if (($concerns | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='12'>しきい値の範囲では特筆すべき懸念は検出されませんでした。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='13'>しきい値の範囲では特筆すべき懸念は検出されませんでした。</td></tr>")
 } else {
   foreach($c in ($concerns | Select-Object -First ($opt.TopN))){
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $c.Host)</td><td class='mono'>$(Html-Escape $c.Interface)</td><td>$(Html-Escape (Format-Pct $c.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $c.UtilOut_pct))</td><td>$(Html-Escape (Format-Pps $c.PPS))</td><td>$(Html-Escape $c.Duplex)</td><td>$($c.InErrors)</td><td>$($c.OutErrors)</td><td>$($c.CRC)</td><td>$($c.Collisions)</td><td>$(Html-Escape $c.Reasons)</td><td>$($c.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $c.Host)</td><td class='mono'>$(Html-Escape $c.IP)</td><td class='mono'>$(Html-Escape $c.Interface)</td><td>$(Html-Escape (Format-Pct $c.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $c.UtilOut_pct))</td><td>$(Html-Escape (Format-Pps $c.PPS))</td><td>$(Html-Escape $c.Duplex)</td><td>$($c.InErrors)</td><td>$($c.OutErrors)</td><td>$($c.CRC)</td><td>$($c.Collisions)</td><td>$(Html-Escape $c.Reasons)</td><td>$($c.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
 
 # Unused candidates
 [void]$sb.AppendLine("<h2>Unused Candidates (DOWN/AdminDown & ≤ $($opt.ZeroBpsForUnused) bps)</h2>")
-[void]$sb.AppendLine("<div class='desc'>状態が <b>DOWN または Admin Down</b> で、直近の入出力が <b>$($opt.ZeroBpsForUnused) bps 以下</b>のポート。空きポート候補です。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Status</th><th>In (last)</th><th>Out (last)</th><th>Last Timestamp</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>状態が DOWN または Admin Down で、直近の入出力が $($opt.ZeroBpsForUnused) bps 以下のポート。空きポート候補です。</div>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Interface</th><th>Status</th><th>In (last)</th><th>Out (last)</th><th>Last Ts</th></tr>")
 $unusedRows = $unused | Sort-Object Host,Interface
 if (($unusedRows | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='6'>該当するポートはありません。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='7'>該当するポートはありません。</td></tr>")
 } else {
   foreach($r in $unusedRows){
     $st = if ($r.LastAdminDown) { 'admin down' } else { $r.LastOper }
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$st</td><td>$(Html-Escape (Format-Bps $r.LastIn_bps))</td><td>$(Html-Escape (Format-Bps $r.LastOut_bps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$st</td><td>$(Html-Escape (Format-Bps $r.LastIn_bps))</td><td>$(Html-Escape (Format-Bps $r.LastOut_bps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
 
 # Duplex/Speed attention
 [void]$sb.AppendLine("<h2>Duplex/Speed Attention (Half duplex or ≤ 100Mb/s)</h2>")
-[void]$sb.AppendLine("<div class='desc'><b>Half-duplex</b> や <b>100Mb/s 以下</b>の速度表記のポート。設定不一致や古いリンクの可能性があります。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Duplex</th><th>Speed</th><th>Last Timestamp</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>Half-duplex や 100Mb/s 以下の速度表記のポート。設定不一致や古いリンクの可能性があります。</div>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Interface</th><th>Duplex</th><th>Speed</th><th>Last Ts</th></tr>")
 $halfRows = $halfOrLow | Sort-Object Host,Interface
 if (($halfRows | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='5'>該当するポートはありません。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='6'>該当するポートはありません。</td></tr>")
 } else {
   foreach($r in $halfRows){
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Ecape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
 
 # Errors
 [void]$sb.AppendLine("<h2>Error Files Summary</h2>")
-[void]$sb.AppendLine("<div class='desc'>エラーファイル（_errors_*.txt）を装置ごとに集計。行数が多い装置ほど通信失敗等が多い傾向です。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Total Lines</th><th>Files</th><th>Last Date</th></tr>")
-if (($errByHost | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='4'>エラーファイルはありません。</td></tr>")
+[void]$sb.AppendLine("<div class='desc'>エラーファイル（_errors_*.txt）を装置（IP）ごとに集計。行数が多い装置ほど通信失敗等が多い傾向です。</div>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Total Lines</th><th>Files</th><th>Last Date</th></tr>")
+if (($errByDevice | Measure-Object).Count -eq 0) {
+  [void]$sb.AppendLine("<tr><td colspan='5'>エラーファイルはありません。</td></tr>")
 } else {
-  foreach($r in $errByHost){
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='warn'>$($r.Lines)</td><td>$($r.Files)</td><td>$(Html-Escape $r.LastDate)</td></tr>")
+  foreach($r in $errByDevice){
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='warn'>$($r.Lines)</td><td>$($r.Files)</td><td>$(Html-Escape $r.LastDate)</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
 
-[void]$sb.AppendLine("<div class='small'>* Notes: 利用率=直近平均の bps / リンク速度（速度表記または BW Kbit/sec）。PPSは直近平均。エラー/CRC/衝突は直近取得時点の合計値です。</div>")
+[void]$sb.AppendLine("<div class='small'>* Notes: Host は表示名（hosts.txt で IP,表示名 を指定）、IP は実アドレス。利用率=直近平均の bps / リンク速度（速度表記または BW Kbit/sec）。PPSは直近平均。エラー/CRC/衝突は直近取得時点の合計値です。</div>")
 [void]$sb.AppendLine("</body></html>")
 
 # write as UTF-8 with BOM
