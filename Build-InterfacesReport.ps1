@@ -47,7 +47,6 @@ $Base = Get-BaseDir
 if (-not $opt.LogsRoot -or $opt.LogsRoot -eq '') { $opt.LogsRoot = Join-Path $Base 'logs' }
 if (-not $opt.OutFile  -or $opt.OutFile  -eq '') { $opt.OutFile  = Join-Path $Base 'interfaces_report.html' }
 if (-not $opt.HostsFile -or $opt.HostsFile -eq '') {
-  # カレント直下の hosts.txt があれば既定に
   $cand = Join-Path $Base 'hosts.txt'
   if (Test-Path -LiteralPath $cand) { $opt.HostsFile = $cand }
 }
@@ -131,7 +130,6 @@ function NzInt64($x){ if ($null -eq $x) { return [int64]0 } else { return [int64
 
 function Parse-LinkBps([string]$s){
   if (-not $s -or $s -eq '') { return $null }
-  # 例: "1000Mb/s" "10Gb/s" "100Mb/s"
   $m = [regex]::Match($s, '(?i)^\s*(?<num>\d+(?:\.\d+)?)\s*(?<unit>[KMG])b/s')
   if (-not $m.Success) { return $null }
   $num = [double]$m.Groups['num'].Value
@@ -164,21 +162,17 @@ function Parse-InterfaceFile([string]$path){
   $ifn       = $h[0].Groups['if'].Value
   $port      = [int]$h[0].Groups['port'].Value
 
-  # IPの判定：ヘッダのhostがIPv4ならそれを、違う場合はフォルダ名（直上）がIPv4ならそれを採用
   $ip = $null
   if (Is-IPv4 $HostToken) { $ip = $HostToken }
   else {
     $parent = Split-Path -Parent $path | Split-Path -Leaf
     if (Is-IPv4 $parent) { $ip = $parent }
   }
-  if (-not $ip) { $ip = $HostToken } # IPv4でないが、表示用に fallback
+  if (-not $ip) { $ip = $HostToken }
 
-  # 表示名の決定：hosts.txt にあればそれ、無ければIPまたは HostToken
   $display = $null
   if ($HostNameMap.ContainsKey($ip)) { $display = $HostNameMap[$ip] }
-  else {
-    if (Is-IPv4 $ip) { $display = $ip } else { $display = $HostToken }
-  }
+  else { if (Is-IPv4 $ip) { $display = $ip } else { $display = $HostToken } }
 
   $blocks = @()
   $lastBwBps = $null
@@ -211,7 +205,6 @@ function Parse-InterfaceFile([string]$path){
     $moerr = $OutErrRx.Match($body);if ($moerr.Success) { $outerr=[int64]$moerr.Groups['outerr'].Value }
     $mcol  = $CollRx.Match($body);  if ($mcol.Success)  { $coll =[int64]$mcol.Groups['coll'].Value }
 
-    # BW ... Kbit/sec フォールバック（最後のブロックの本文から取得）
     if ($i -eq ($h.Count - 1)) {
       $mbw = $BandwidthRx.Match($body)
       if ($mbw.Success) { $lastBwBps = [int64]$mbw.Groups['bw'].Value * 1000 }
@@ -224,7 +217,6 @@ function Parse-InterfaceFile([string]$path){
     }
   }
 
-  # flap count
   $flaps = 0
   for ($j=1; $j -lt $blocks.Count; $j++){
     if ($blocks[$j].Oper -ne $blocks[$j-1].Oper -or $blocks[$j].Proto -ne $blocks[$j-1].Proto){
@@ -237,7 +229,6 @@ function Parse-InterfaceFile([string]$path){
   $maxIn  = ($blocks | Measure-Object -Property In_bps -Maximum).Maximum
   $maxOut = ($blocks | Measure-Object -Property Out_bps -Maximum).Maximum
 
-  # link bps from LastSpeed, or fallback to BW Kbit/sec
   $linkBps = Parse-LinkBps $last.Speed
   if (-not $linkBps -and $lastBwBps) { $linkBps = $lastBwBps }
 
@@ -246,9 +237,9 @@ function Parse-InterfaceFile([string]$path){
 
   [pscustomobject]@{
     FilePath      = $path
-    Host          = $display     # ★ 表示名（テーブル表示用）
-    IP            = $ip          # ★ IP列（明示表示用）
-    HostToken     = $HostToken   # 参考（解析に未使用）
+    Host          = $display
+    IP            = $ip
+    HostToken     = $HostToken
     Interface     = $ifn
     Port          = $port
     Captures      = $blocks.Count
@@ -297,10 +288,7 @@ $errRows = @()
 foreach ($ef in $errFiles) {
   $folder = Split-Path -Parent $ef.FullName | Split-Path -Leaf
   $ip = $folder
-  if (-not (Is-IPv4 $ip)) {
-    # フォルダ名がIPでない場合は hosts map から逆引き不可。IP列はそのまま表示。
-    $ip = $folder
-  }
+  if (-not (Is-IPv4 $ip)) { $ip = $folder }
   $disp = if ($HostNameMap.ContainsKey($ip)) { $HostNameMap[$ip] } else { $ip }
 
   $lines = Get-Content -LiteralPath $ef.FullName -ErrorAction SilentlyContinue
@@ -356,7 +344,7 @@ $byPps = $ifs | ForEach-Object {
   $_ | Add-Member -PassThru NoteProperty Peak_pps $p
 } | Sort-Object Peak_pps -Descending
 
-# device scorecards: IP単位で集計し、表示は DisplayName + IP
+# device scorecards: IP単位
 $byDevice = $ifs | Group-Object IP | ForEach-Object {
   $g = $_.Group
   $ip = $_.Name
@@ -371,7 +359,7 @@ $byDevice = $ifs | Group-Object IP | ForEach-Object {
   }
 } | Sort-Object Host, IP
 
-# error summary per device (IP)
+# error summary per device
 $errByDevice = $errRows | Group-Object IP | ForEach-Object {
   $disp = ($_.Group | Select-Object -First 1).Host
   [pscustomobject]@{
@@ -547,7 +535,7 @@ if (($halfRows | Measure-Object).Count -eq 0) {
   [void]$sb.AppendLine("<tr><td colspan='6'>該当するポートはありません。</td></tr>")
 } else {
   foreach($r in $halfRows){
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Ecape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
