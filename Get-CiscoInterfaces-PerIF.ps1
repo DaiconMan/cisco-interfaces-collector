@@ -1,12 +1,11 @@
-﻿# =======================
-# Get-CiscoInterfaces-PerIF.ps1  (Compat: no CmdletBinding/param at script scope)
-#  - 引数は自前パーサで処理（PowerShell 5/7 を推奨）
-#  - 出力: <script>\logs\<host>\<IF>.txt （追記、時刻ヘッダつき）
-#  - Posh-SSH を CurrentUser に自動導入（PowerShellGet/Install-Module が使える場合）
-#  - Port.txt/show.txt は作らない（起動時に残骸があれば清掃）
-#======================= #>
+﻿# Get-CiscoInterfaces-PerIF.ps1 (PowerShell 5.1 compatible; save as UTF-8 with BOM)
+# - Collects "show interfaces <IF>" per interface from Cisco IOS/IOS-XE via SSH (Posh-SSH)
+# - Appends to .\logs\<host>\<IF>.txt with timestamp header
+# - No Port.txt/show.txt (legacy leftovers are removed on start)
+# - Auto-installs Posh-SSH (CurrentUser) if possible; also tries local .\modules\Posh-SSH
+# - Works on Windows PowerShell 5.1 and PowerShell 7
 
-# ==== 自前引数パーサ（-Name Value / -Switch 形式）====
+# ---- simple arg parser (supports: -HostsFile, -Username, -PasswordFile/-PasswordPlain, -Repeat, etc.) ----
 $opt = @{
   HostsFile       = $null
   Username        = $null
@@ -50,6 +49,11 @@ function Get-BaseDir {
   (Get-Location).Path
 }
 
+# Normalize console/file encoding a bit (safe for 5.1)
+try {
+  $script:OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch {}
+
 $__BaseDir = Get-BaseDir
 if (-not $opt.LogDir -or $opt.LogDir.Trim() -eq "") { $opt.LogDir = Join-Path $__BaseDir 'logs' }
 
@@ -59,20 +63,56 @@ function Ensure-Folders([string]$PathToLog){
   }
 }
 
-function Ensure-Module([string]$Name, [Version]$MinVersion = [Version]"3.0.9"){
-  $have = Get-Module -ListAvailable -Name $Name | Where-Object { $_.Version -ge $MinVersion }
-  if (-not $have) {
-    if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
-      throw "Install-Module が使えません。PowerShell 5+ と PowerShellGet が必要です（Posh-SSH を自動導入できません）。"
-    }
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue)) {
-      Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
-    }
-    try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
-    Install-Module -Name $Name -Force -Scope CurrentUser -AllowClobber -Repository PSGallery -ErrorAction Stop
+# Try local modules\<Name> first, then PowerShellGet (CurrentUser)
+function Ensure-Module([string]$ModuleName, [Version]$MinVersion = [Version]"3.0.9"){
+  # local folder?
+  $localPath = Join-Path (Join-Path $__BaseDir 'modules') $ModuleName
+  if (Test-Path -LiteralPath $localPath) {
+    try {
+      Import-Module $localPath -Force -ErrorAction Stop
+      $m = Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1
+      if ($m -and $m.Version -ge $MinVersion) { return }
+    } catch {}
   }
-  Import-Module $Name -Force -ErrorAction Stop
+  # already available?
+  $have = Get-Module -ListAvailable -Name $ModuleName | Where-Object { $_.Version -ge $MinVersion }
+  if ($have) {
+    Import-Module $ModuleName -Force -ErrorAction Stop
+    return
+  }
+  # try online install (CurrentUser)
+  if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
+    throw "Install-Module is not available. Please install PowerShellGet or place the module under .\modules\$ModuleName"
+  }
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+  $gallery = $null
+  try { $gallery = Get-PSRepository -ErrorAction Stop | Where-Object { $_.Name -eq 'PSGallery' } } catch {}
+  if (-not $gallery) {
+    try {
+      Register-PSRepository -Name 'PSGallery' `
+        -SourceLocation 'https://www.powershellgallery.com/api/v2' `
+        -ScriptSourceLocation 'https://www.powershellgallery.com/api/v2' `
+        -InstallationPolicy Trusted -ErrorAction Stop
+    } catch {
+      Write-Warning "Failed to register PSGallery (will still try install). $_"
+    }
+  } else {
+    try {
+      if ($gallery.InstallationPolicy -ne 'Trusted') {
+        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+      }
+    } catch {}
+  }
+  try {
+    Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
+  } catch {
+    try {
+      Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber -Repository PSGallery -ErrorAction Stop
+    } catch {
+      throw "Failed to install module ${ModuleName}: $($_.Exception.Message)"
+    }
+  }
+  Import-Module $ModuleName -Force -ErrorAction Stop
 }
 
 function Normalize-Path([string]$p) {
@@ -91,12 +131,12 @@ function Get-PlainPassword {
   if ($opt.PasswordFile)  {
     $pf = Normalize-Path $opt.PasswordFile
     if ($opt.VerboseLog) { Write-Info ("PasswordFile: {0}" -f $pf) }
-    if (-not (Test-Path -LiteralPath $pf)) { throw "PasswordFile が見つかりません: $pf" }
+    if (-not (Test-Path -LiteralPath $pf)) { throw "PasswordFile not found: $pf" }
     $raw = Get-Content -LiteralPath $pf -Raw
     $raw = $raw -replace '^\uFEFF',''
     return $raw.TrimEnd("`r","`n")
   }
-  throw "PasswordPlain か PasswordFile のどちらかを指定してください。"
+  throw "Either -PasswordPlain or -PasswordFile is required."
 }
 
 function Parse-HostLine([string]$Line){
@@ -171,12 +211,14 @@ function Collect-Target([string]$TargetHost,[int]$Port,[pscredential]$Credential
             -AcceptKey -ConnectionTimeout $TimeoutSec -ErrorAction Stop
     try {
       if ($VerboseLog) { Write-Info "shellstream start" }
-      $shell = New-SSHShellStream -SessionId $sess.SessionId -TerminalName 'vt100'  # minimal args for compatibility
+      # keep args minimal for older Posh-SSH
+      $shell = New-SSHShellStream -SessionId $sess.SessionId -TerminalName 'vt100'
+
       Start-Sleep -Milliseconds 200
       while ($shell.DataAvailable) { $null = $shell.Read() }
 
       $ifs = Get-InterfaceNames -Shell $shell -TimeoutSec $TimeoutSec -VerboseLog:$VerboseLog
-      if (!$ifs -or $ifs.Count -eq 0) { throw "インターフェース一覧の取得に失敗しました。" }
+      if (!$ifs -or $ifs.Count -eq 0) { throw "Failed to enumerate interfaces." }
 
       foreach($if in $ifs) {
         if ($VerboseLog) { Write-Info ("show interfaces {0}" -f $if) }
@@ -196,7 +238,7 @@ function Collect-Target([string]$TargetHost,[int]$Port,[pscredential]$Credential
     if (-not (Test-Path -LiteralPath $elogDir)) { New-Item -ItemType Directory -Path $elogDir -Force | Out-Null }
     $line = ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'), $msg.Trim())
     Add-Content -LiteralPath $elog -Value $line -Encoding UTF8
-    Write-Warning ("NG: {0} → {1}" -f $TargetHost,$elog)
+    Write-Warning ("NG: {0} -> {1}" -f $TargetHost,$elog)
   }
 }
 
@@ -215,36 +257,31 @@ function Cleanup-LegacyFiles([string]$BaseDir,[string]$LogsRoot){
   }
 }
 
-# ==== 実行開始 ====
+# ---- main ----
 Ensure-Folders -PathToLog $opt.LogDir
 Cleanup-LegacyFiles -BaseDir $__BaseDir -LogsRoot $opt.LogDir
 
-# 必須引数チェック
-if (-not $opt.HostsFile) { throw "必須: -HostsFile <path>" }
-if (-not $opt.Username)  { throw "必須: -Username <name>" }
+if (-not $opt.HostsFile) { throw "Required: -HostsFile <path>" }
+if (-not $opt.Username)  { throw "Required: -Username <name>" }
 
-# モジュール
-Ensure-Module  -Name 'Posh-SSH'
+Ensure-Module  -ModuleName 'Posh-SSH'
 
-# パスワード
 $plain = Get-PlainPassword
 $secure = ConvertTo-SecureString $plain -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential ($opt.Username, $secure)
 
-# 接続先リスト
 $hf = Normalize-Path $opt.HostsFile
-if (-not (Test-Path -LiteralPath $hf)) { throw "HostsFile が見つかりません: $hf" }
+if (-not (Test-Path -LiteralPath $hf)) { throw "HostsFile not found: $hf" }
 $rawLines = Get-Content -LiteralPath $hf
 $targets = @()
 foreach ($line in $rawLines) {
   if ($line -match '^\s*$') { continue }
   if ($line -match '^\s*#')  { continue }
   $item = Parse-HostLine $line
-  if ($item) { $targets += $item } else { Write-Warning ("書式不正のため無視: {0}" -f $line) }
+  if ($item) { $targets += $item } else { Write-Warning ("Invalid host line skipped: {0}" -f $line) }
 }
-if ($targets.Count -eq 0) { throw "有効な接続先がありません（$hf）。" }
+if ($targets.Count -eq 0) { throw "No valid targets in $hf" }
 
-# ループ制御
 $start = Get-Date
 $iter  = 0
 function Stop-ByDuration($s,$dur){ if($dur -le 0){$false}else{ (Get-Date) -ge $s.AddMinutes($dur) } }
