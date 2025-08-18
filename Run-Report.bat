@@ -1,4 +1,3 @@
-
 @echo off
 setlocal EnableExtensions
 
@@ -41,9 +40,9 @@ rem PowerShell 実行ファイルの検出（pwsh 優先）
 set "PS=pwsh.exe"
 where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
 
-rem --- PowerShell 引数の組み立て（Run-Collector と同型／\" は使わない） ---
-set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File ""%ABS_SCRIPT%"" -LogsRoot ""%ABS_LOGS%"" -OutFile ""%ABS_OUT%"" -TopN %TOPN% -UnusedThreshold %UNUSED_THRESHOLD%"
-if "%VERBOSE%"=="1" set "PSARGS=%PSARGS% -Verbose"
+rem 追加オプション（Verbose）
+set "EXTRA="
+if "%VERBOSE%"=="1" set "EXTRA=-Verbose"
 
 echo * 実行開始: %date% %time%
 echo   PS       : %PS%
@@ -54,7 +53,11 @@ echo   TopN     : %TOPN%
 echo   UnusedTh : %UNUSED_THRESHOLD%
 if "%VERBOSE%"=="1" echo   Verbose  : on
 
-"%PS%" %PSARGS%
+echo --- 実行コマンド ---
+echo "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -LogsRoot "%ABS_LOGS%" -OutFile "%ABS_OUT%" -TopN %TOPN% -UnusedThreshold %UNUSED_THRESHOLD% %EXTRA%
+echo --------------------
+
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -LogsRoot "%ABS_LOGS%" -OutFile "%ABS_OUT%" -TopN %TOPN% -UnusedThreshold %UNUSED_THRESHOLD% %EXTRA%
 set "RC=%ERRORLEVEL%"
 echo * 終了コード: %RC%
 if not "%RC%"=="0" echo [ERROR] 生成に失敗しました。上のメッセージを確認してください.
