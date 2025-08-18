@@ -1,6 +1,6 @@
 # Build-InterfacesReport.ps1
 # - Scan .\logs\<hostIP>\<IF>.txt and _errors_*.txt (from Get-CiscoInterfaces-PerIF.ps1)
-# - Output a single HTML report with performance signals (5min/seconds bps/pps, utilization, errors)
+# - Output a single HTML report with performance signals (5min/seconds bps/pps, utilization, errors, deltas)
 # - PowerShell 5.1 compatible (no "??", no negative index), no external modules
 # - hosts.txt (IP,DisplayName) を読み取り、"Host" 列には表示名、"IP" 列を別途出力
 
@@ -108,6 +108,11 @@ $CollRx    = [regex]'(?mi)\b(?<coll>\d+)\s+collisions\b'
 # 帯域（BW 1000000 Kbit/sec）フォールバック用
 $BandwidthRx = [regex]'(?mi)^\s*MTU\s+\d+.*?,\s*BW\s+(?<bw>\d+)\s+Kbit/sec'
 
+# output drops（複数表記を拾う）
+$TotOutDropRx = [regex]'(?mi)^\s*(?:Total\s+)?output drops?\s*[:=]\s*(?<drops>\d+)\b'
+$OutQDropRx   = [regex]'(?mi)^\s*Output queue:\s*\d+/\d+\s*\(size/max\)\s*,\s*(?<drops>\d+)\s+drops\b'
+$AnyOutDropRx = [regex]'(?mi)\b(?<drops>\d+)\s+output drops\b'
+
 # ---------- helpers ----------
 function Format-Bps([Nullable[int64]]$v){
   if ($null -eq $v) { return '' }
@@ -162,6 +167,7 @@ function Parse-InterfaceFile([string]$path){
   $ifn       = $h[0].Groups['if'].Value
   $port      = [int]$h[0].Groups['port'].Value
 
+  # IP 判定
   $ip = $null
   if (Is-IPv4 $HostToken) { $ip = $HostToken }
   else {
@@ -170,6 +176,7 @@ function Parse-InterfaceFile([string]$path){
   }
   if (-not $ip) { $ip = $HostToken }
 
+  # 表示名
   $display = $null
   if ($HostNameMap.ContainsKey($ip)) { $display = $HostNameMap[$ip] }
   else { if (Is-IPv4 $ip) { $display = $ip } else { $display = $HostToken } }
@@ -186,6 +193,7 @@ function Parse-InterfaceFile([string]$path){
     $oper=''; $proto=''; $adminDown=$false
     $duplex=''; $speed=''; $inbps=$null; $outbps=$null; $inpps=$null; $outpps=$null
     $inerr=$null; $outerr=$null; $crc=$null; $coll=$null
+    $outdrops=$null
 
     $m = $StateRx.Match($body)
     if ($m.Success) {
@@ -205,6 +213,19 @@ function Parse-InterfaceFile([string]$path){
     $moerr = $OutErrRx.Match($body);if ($moerr.Success) { $outerr=[int64]$moerr.Groups['outerr'].Value }
     $mcol  = $CollRx.Match($body);  if ($mcol.Success)  { $coll =[int64]$mcol.Groups['coll'].Value }
 
+    # output drops（優先度: Total > Output queue > 任意パターン）
+    $mdt  = $TotOutDropRx.Match($body)
+    if ($mdt.Success) { $outdrops = [int64]$mdt.Groups['drops'].Value }
+    else {
+      $mdq = $OutQDropRx.Match($body)
+      if ($mdq.Success) { $outdrops = [int64]$mdq.Groups['drops'].Value }
+      else {
+        $mda = $AnyOutDropRx.Match($body)
+        if ($mda.Success) { $outdrops = [int64]$mda.Groups['drops'].Value }
+      }
+    }
+
+    # BW ... Kbit/sec フォールバック（最後のブロックの本文から取得）
     if ($i -eq ($h.Count - 1)) {
       $mbw = $BandwidthRx.Match($body)
       if ($mbw.Success) { $lastBwBps = [int64]$mbw.Groups['bw'].Value * 1000 }
@@ -213,10 +234,11 @@ function Parse-InterfaceFile([string]$path){
     $blocks += [pscustomobject]@{
       Ts=$ts; Oper=$oper; Proto=$proto; AdminDown=$adminDown; Duplex=$duplex; Speed=$speed;
       In_bps=$inbps; Out_bps=$outbps; In_pps=$inpps; Out_pps=$outpps;
-      InErrors=$inerr; OutErrors=$outerr; CRC=$crc; Collisions=$coll
+      InErrors=$inerr; OutErrors=$outerr; CRC=$crc; Collisions=$coll; OutDrops=$outdrops
     }
   }
 
+  # flap count
   $flaps = 0
   for ($j=1; $j -lt $blocks.Count; $j++){
     if ($blocks[$j].Oper -ne $blocks[$j-1].Oper -or $blocks[$j].Proto -ne $blocks[$j-1].Proto){
@@ -229,11 +251,24 @@ function Parse-InterfaceFile([string]$path){
   $maxIn  = ($blocks | Measure-Object -Property In_bps -Maximum).Maximum
   $maxOut = ($blocks | Measure-Object -Property Out_bps -Maximum).Maximum
 
+  # link bps from LastSpeed, or fallback to BW Kbit/sec
   $linkBps = Parse-LinkBps $last.Speed
   if (-not $linkBps -and $lastBwBps) { $linkBps = $lastBwBps }
 
   $utilIn  = $null; if ($linkBps -and ($linkBps -gt 0) -and $last.In_bps  -ne $null) { $utilIn  = [double]$last.In_bps  * 100.0 / $linkBps }
   $utilOut = $null; if ($linkBps -and ($linkBps -gt 0) -and $last.Out_bps -ne $null) { $utilOut = [double]$last.Out_bps * 100.0 / $linkBps }
+
+  # deltas（直前との差分）
+  $prev = $null
+  if ($blocks.Count -ge 2) { $prev = $blocks[$lastIndex-1] }
+  $dInErr  = $null; $dOutErr = $null; $dCRC = $null; $dColl = $null; $dOutDrops = $null
+  if ($prev) {
+    if ($last.InErrors  -ne $null -and $prev.InErrors  -ne $null) { $dInErr   = [int64]$last.InErrors  - [int64]$prev.InErrors  }
+    if ($last.OutErrors -ne $null -and $prev.OutErrors -ne $null) { $dOutErr  = [int64]$last.OutErrors - [int64]$prev.OutErrors }
+    if ($last.CRC       -ne $null -and $prev.CRC       -ne $null) { $dCRC     = [int64]$last.CRC       - [int64]$prev.CRC       }
+    if ($last.Collisions-ne $null -and $prev.Collisions-ne $null) { $dColl    = [int64]$last.Collisions- [int64]$prev.Collisions }
+    if ($last.OutDrops  -ne $null -and $prev.OutDrops  -ne $null) { $dOutDrops= [int64]$last.OutDrops  - [int64]$prev.OutDrops  }
+  }
 
   [pscustomobject]@{
     FilePath      = $path
@@ -263,6 +298,12 @@ function Parse-InterfaceFile([string]$path){
     OutErrors     = $last.OutErrors
     CRC           = $last.CRC
     Collisions    = $last.Collisions
+    OutDrops      = $last.OutDrops
+    DeltaInErr    = $dInErr
+    DeltaOutErr   = $dOutErr
+    DeltaCRC      = $dCRC
+    DeltaColl     = $dColl
+    DeltaOutDrops = $dOutDrops
     FlapCount     = $flaps
   }
 }
@@ -282,7 +323,7 @@ foreach ($f in $ifFiles) {
   }
 }
 
-# errors
+# errors (connection logs)
 $errFiles = Get-ChildItem -LiteralPath $LogsRoot -Recurse -File -Filter '_errors_*.txt'
 $errRows = @()
 foreach ($ef in $errFiles) {
@@ -370,6 +411,12 @@ $errByDevice = $errRows | Group-Object IP | ForEach-Object {
     LastDate = ($_.Group | Sort-Object Date | Select-Object -Last 1).Date
   }
 } | Sort-Object -Property Lines -Descending
+
+# top delta errors/drops
+$byDelta = $ifs | ForEach-Object {
+  $sum = (NzInt64 $_.DeltaInErr) + (NzInt64 $_.DeltaOutErr) + (NzInt64 $_.DeltaCRC) + (NzInt64 $_.DeltaColl) + (NzInt64 $_.DeltaOutDrops)
+  $_ | Add-Member -PassThru NoteProperty DeltaSum $sum
+} | Where-Object { $_.DeltaSum -gt 0 } | Sort-Object DeltaSum -Descending
 
 # ---------- HTML ----------
 $css = @'
@@ -462,6 +509,20 @@ if (($topPps | Measure-Object).Count -eq 0) {
 }
 [void]$sb.AppendLine("</table>")
 
+# NEW: Top Δ Errors/CRC/OutDrops
+$topDelta = $byDelta | Select-Object -First $opt.TopN
+[void]$sb.AppendLine("<h2>Top $($opt.TopN) Δ Errors/CRC/OutDrops (last interval)</h2>")
+[void]$sb.AppendLine("<div class='desc'>直近2回の取得間で、エラー系カウンタが増加したポートを増分合計（Δ）順に表示します。</div>")
+[void]$sb.AppendLine("<table><tr><th>#</th><th>Host</th><th>IP</th><th>Interface</th><th>ΔInErr</th><th>ΔOutErr</th><th>ΔCRC</th><th>ΔColl</th><th>ΔOutDrops</th><th>Last Ts</th></tr>")
+$rank=0
+foreach($r in $topDelta){ $rank++
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.IP)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$([string](NzInt64 $r.DeltaInErr))</td><td>$([string](NzInt64 $r.DeltaOutErr))</td><td>$([string](NzInt64 $r.DeltaCRC))</td><td>$([string](NzInt64 $r.DeltaColl))</td><td>$([string](NzInt64 $r.DeltaOutDrops))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+}
+if (($topDelta | Measure-Object).Count -eq 0) {
+  [void]$sb.AppendLine("<tr><td colspan='10'>直近の取得間で増加したエラー/ドロップは検出されませんでした。</td></tr>")
+}
+[void]$sb.AppendLine("</table>")
+
 # Potential Performance Concerns
 $concerns = @()
 foreach($x in $ifs){
@@ -476,9 +537,16 @@ foreach($x in $ifs){
 
   if ($x.LastDuplex -match '^Half$') { $reasons += "Half-duplex" }
   if ($x.FlapCount -gt 0) { $reasons += "Flapping" }
+
   if ((NzInt64 $x.InErrors) -gt 0 -or (NzInt64 $x.OutErrors) -gt 0 -or (NzInt64 $x.CRC) -gt 0 -or (NzInt64 $x.Collisions) -gt 0) {
     $reasons += "Errors/CRC/Collisions"
   }
+  # NEW: 増分が出ていれば強く通知
+  $d1=(NzInt64 $x.DeltaInErr); $d2=(NzInt64 $x.DeltaOutErr); $d3=(NzInt64 $x.DeltaCRC); $d4=(NzInt64 $x.DeltaColl); $d5=(NzInt64 $x.DeltaOutDrops)
+  if ( ($d1+$d2+$d3+$d4+$d5) -gt 0 ) {
+    $reasons += "Errors/Drops increasing (ΔIn=$d1, ΔOut=$d2, ΔCRC=$d3, ΔColl=$d4, ΔOutDrops=$d5)"
+  }
+
   if ($reasons.Count -gt 0) {
     $concerns += [pscustomobject]@{
       Host       = $x.Host
@@ -492,21 +560,27 @@ foreach($x in $ifs){
       OutErrors  = $x.OutErrors
       CRC        = $x.CRC
       Collisions = $x.Collisions
+      OutDrops   = $x.OutDrops
+      DeltaInErr = $x.DeltaInErr
+      DeltaOutErr= $x.DeltaOutErr
+      DeltaCRC   = $x.DeltaCRC
+      DeltaColl  = $x.DeltaColl
+      DeltaOutDrops = $x.DeltaOutDrops
       LastTs     = $x.LastTs
       Reasons    = ($reasons -join ', ')
     }
   }
 }
-$concerns = $concerns | Sort-Object @{e={$_.UtilIn_pct};d=$true}, @{e={$_.UtilOut_pct};d=$true}, @{e={$_.PPS};d=$true}
+$concerns = $concerns | Sort-Object @{e={$_.DeltaOutDrops};d=$true}, @{e={$_.DeltaInErr};d=$true}, @{e={$_.DeltaCRC};d=$true}, @{e={$_.UtilIn_pct};d=$true}, @{e={$_.UtilOut_pct};d=$true}, @{e={$_.PPS};d=$true}
 
 [void]$sb.AppendLine("<h2>Potential Performance Concerns</h2>")
-[void]$sb.AppendLine("<div class='desc'>高い利用率（警告≥$($opt.UtilWarnPct)%／要注意≥$($opt.UtilSeverePct)%）、高PPS（≥$($opt.PpsWarn)）や Half-duplex、フラップ、エラー/CRC/衝突 を検出します。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Interface</th><th>Util In</th><th>Util Out</th><th>Peak PPS</th><th>Duplex</th><th>InErr</th><th>OutErr</th><th>CRC</th><th>Coll</th><th>Reasons</th><th>Last Ts</th></tr>")
+[void]$sb.AppendLine("<div class='desc'>高い利用率（警告≥$($opt.UtilWarnPct)%／要注意≥$($opt.UtilSeverePct)%）、高PPS（≥$($opt.PpsWarn)）や Half-duplex、フラップ、<b>エラー/CRC/衝突/出力ドロップの増分（Δ）</b>を検出します。</div>")
+[void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Interface</th><th>Util In</th><th>Util Out</th><th>Peak PPS</th><th>Duplex</th><th>InErr</th><th>OutErr</th><th>CRC</th><th>Coll</th><th>OutDrops</th><th>ΔIn</th><th>ΔOut</th><th>ΔCRC</th><th>ΔColl</th><th>ΔOutDrops</th><th>Reasons</th><th>Last Ts</th></tr>")
 if (($concerns | Measure-Object).Count -eq 0) {
-  [void]$sb.AppendLine("<tr><td colspan='13'>しきい値の範囲では特筆すべき懸念は検出されませんでした。</td></tr>")
+  [void]$sb.AppendLine("<tr><td colspan='19'>しきい値の範囲では特筆すべき懸念は検出されませんでした。</td></tr>")
 } else {
   foreach($c in ($concerns | Select-Object -First ($opt.TopN))){
-    [void]$sb.AppendLine("<tr><td>$(Html-Escape $c.Host)</td><td class='mono'>$(Html-Escape $c.IP)</td><td class='mono'>$(Html-Escape $c.Interface)</td><td>$(Html-Escape (Format-Pct $c.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $c.UtilOut_pct))</td><td>$(Html-Escape (Format-Pps $c.PPS))</td><td>$(Html-Escape $c.Duplex)</td><td>$($c.InErrors)</td><td>$($c.OutErrors)</td><td>$($c.CRC)</td><td>$($c.Collisions)</td><td>$(Html-Escape $c.Reasons)</td><td>$($c.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(Html-Escape $c.Host)</td><td class='mono'>$(Html-Escape $c.IP)</td><td class='mono'>$(Html-Escape $c.Interface)</td><td>$(Html-Escape (Format-Pct $c.UtilIn_pct))</td><td>$(Html-Escape (Format-Pct $c.UtilOut_pct))</td><td>$(Html-Escape (Format-Pps $c.PPS))</td><td>$(Html-Escape $c.Duplex)</td><td>$($c.InErrors)</td><td>$($c.OutErrors)</td><td>$($c.CRC)</td><td>$($c.Collisions)</td><td>$([string](NzInt64 $c.OutDrops))</td><td>$([string](NzInt64 $c.DeltaInErr))</td><td>$([string](NzInt64 $c.DeltaOutErr))</td><td>$([string](NzInt64 $c.DeltaCRC))</td><td>$([string](NzInt64 $c.DeltaColl))</td><td>$([string](NzInt64 $c.DeltaOutDrops))</td><td>$(Html-Escape $c.Reasons)</td><td>$($c.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
   }
 }
 [void]$sb.AppendLine("</table>")
@@ -540,7 +614,7 @@ if (($halfRows | Measure-Object).Count -eq 0) {
 }
 [void]$sb.AppendLine("</table>")
 
-# Errors
+# Errors (connection logs)
 [void]$sb.AppendLine("<h2>Error Files Summary</h2>")
 [void]$sb.AppendLine("<div class='desc'>エラーファイル（_errors_*.txt）を装置（IP）ごとに集計。行数が多い装置ほど通信失敗等が多い傾向です。</div>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>IP</th><th>Total Lines</th><th>Files</th><th>Last Date</th></tr>")
@@ -553,7 +627,7 @@ if (($errByDevice | Measure-Object).Count -eq 0) {
 }
 [void]$sb.AppendLine("</table>")
 
-[void]$sb.AppendLine("<div class='small'>* Notes: Host は表示名（hosts.txt で IP,表示名 を指定）、IP は実アドレス。利用率=直近平均の bps / リンク速度（速度表記または BW Kbit/sec）。PPSは直近平均。エラー/CRC/衝突は直近取得時点の合計値です。</div>")
+[void]$sb.AppendLine("<div class='small'>* Notes: Host は表示名（hosts.txt で IP,表示名 を指定）、IP は実アドレス。利用率=直近平均の bps / リンク速度（速度表記または BW Kbit/sec）。PPSは直近平均。エラー/CRC/衝突は直近取得時点の合計値、Δは直近2回の取得間の増分。Output drops は 'Total output drops' または 'Output queue ... drops' 等を検出します。</div>")
 [void]$sb.AppendLine("</body></html>")
 
 # write as UTF-8 with BOM
