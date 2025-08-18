@@ -1,23 +1,25 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions
 
-rem ===================== 設定（必要に応じて変更） =====================
-rem ※ この .bat と .ps1 / hosts.txt / password.txt は同じフォルダに置く前提
+rem ===== 設定（この bat と同じフォルダに ps1 / hosts.txt / password.txt を置く想定）=====
 set "SCRIPT=Get-CiscoInterfaces-PerIF.ps1"
 set "HOSTS=hosts.txt"
 set "PASSFILE=password.txt"
 set "USERNAME=cisco"
 
-rem 繰り返し設定
+rem 繰り返し
 set "REPEAT=1"
 set "INTERVAL_MIN=60"
-set "DURATION_MIN=0"   rem 0=無制限（REPEAT=1のときだけ有効）
+set "DURATION_MIN=0"  rem 0=無制限（REPEAT=1のとき適用）
 
 rem 失敗時に画面を閉じない（1=有効/0=無効）
 set "DEBUG_HOLD=1"
-rem =====================================================================
+rem ======================================================================
 
-rem --- 実行ディレクトリへ移動（UNCなら一時ドライブ割当） ---
+rem --- 文字コード（日本語コンソール用 / Shift-JIS）---
+chcp 932 >nul 2>&1
+
+rem --- 実行ディレクトリへ移動（UNC/OneDrive でも pushd で安定） ---
 set "BASE=%~dp0"
 pushd "%BASE%" >nul 2>&1
 if errorlevel 1 (
@@ -26,29 +28,30 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem --- コンソールをUTF-8に（表示安定用。失敗しても無視） ---
-chcp 65001 >nul 2>&1
-
 rem --- PowerShell 実行ファイルの検出（pwsh 優先） ---
 set "PS=pwsh.exe"
 where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
 
-rem --- 前提ファイル確認（相対パスでOK） ---
-if not exist ".\%SCRIPT%"  ( echo [ERROR] スクリプトが見つかりません: ".\%SCRIPT%"  & goto :fail )
-if not exist ".\%HOSTS%"   ( echo [ERROR] hosts.txt が見つかりません: ".\%HOSTS%"   & goto :fail )
-set "PWMSG=Password : prompt"
-if exist ".\%PASSFILE%" set "PWMSG=Password : file .\%PASSFILE%"
+rem --- 前提ファイル確認 ---
+if not exist "%SCRIPT%"  ( echo [ERROR] スクリプトが見つかりません: "%CD%\%SCRIPT%"  & goto :fail )
+if not exist "%HOSTS%"   ( echo [ERROR] hosts.txt が見つかりません: "%CD%\%HOSTS%"   & goto :fail )
 
-rem --- PowerShell 引数を相対パスで組み立て（\" は使わない） ---
-set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File "".\%SCRIPT%"" -HostsFile "".\%HOSTS%"" -Username ""%USERNAME%"""
-if exist ".\%PASSFILE%" set "PSARGS=%PSARGS% -PasswordFile "".\%PASSFILE%"""
-if "%REPEAT%"=="1"       set "PSARGS=%PSARGS% -Repeat -IntervalMinutes %INTERVAL_MIN%"
+if exist "%PASSFILE%" (
+  set "PWMSG=Password : file %CD%\%PASSFILE%"
+) else (
+  set "PWMSG=Password : prompt"
+)
+
+rem --- PowerShell 引数の組み立て（\" は使わない / フルパスで確実に） ---
+set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File ""%CD%\%SCRIPT%"" -HostsFile ""%CD%\%HOSTS%"" -Username ""%USERNAME%"""
+if exist "%PASSFILE%" set "PSARGS=%PSARGS% -PasswordFile ""%CD%\%PASSFILE%"""
+if "%REPEAT%"=="1"     set "PSARGS=%PSARGS% -Repeat -IntervalMinutes %INTERVAL_MIN%"
 if not "%DURATION_MIN%"=="0" set "PSARGS=%PSARGS% -DurationMinutes %DURATION_MIN%"
 
 echo * 実行開始: %date% %time%
 echo   PS        : %PS%
-echo   Script    : .\%SCRIPT%
-echo   Hosts     : .\%HOSTS%
+echo   Script    : %CD%\%SCRIPT%
+echo   Hosts     : %CD%\%HOSTS%
 echo   Username  : %USERNAME%
 echo   %PWMSG%
 if "%REPEAT%"=="1" (
@@ -56,6 +59,10 @@ if "%REPEAT%"=="1" (
 ) else (
   echo   Repeat   : no
 )
+
+echo --- 実行コマンド ---
+echo %PS% %PSARGS%
+echo --------------------
 
 "%PS%" %PSARGS%
 set "RC=%ERRORLEVEL%"
