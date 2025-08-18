@@ -1,0 +1,33 @@
+# PowerShell 5.1 推奨の前準備
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+  Install-PackageProvider -Name NuGet -Scope CurrentUser -Force
+}
+
+# ギャラリーを信頼（失敗しても続行可）
+try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
+
+# ユーザー領域に導入（管理者不要）
+Install-Module -Name Posh-SSH -Scope CurrentUser -Force -AllowClobber
+
+# 読み込み確認
+Import-Module Posh-SSH -Force
+Get-Module -ListAvailable Posh-SSH | Sort-Object Version -Descending | Select Name,Version,ModuleBase
+
+# まず TLS と NuGet
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+  Install-PackageProvider -Name NuGet -Scope CurrentUser -Force
+}
+
+# 既存の PSGallery が壊れている場合は一旦消す（無ければ無視）
+try { Unregister-PSRepository -Name PSGallery -ErrorAction SilentlyContinue } catch {}
+
+# PSGallery を再登録
+Register-PSRepository -Name PSGallery `
+  -SourceLocation 'https://www.powershellgallery.com/api/v2' `
+  -ScriptSourceLocation 'https://www.powershellgallery.com/api/v2' `
+  -InstallationPolicy Trusted
+
+# そしてインストール
+Install-Module -Name Posh-SSH -Scope CurrentUser -Force -AllowClobber
