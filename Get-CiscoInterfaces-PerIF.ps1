@@ -1,11 +1,29 @@
-﻿# Get-CiscoInterfaces-PerIF.ps1 (PowerShell 5.1 compatible; save as UTF-8 with BOM)
+﻿# Get-CiscoInterfaces-PerIF.ps1 (PowerShell 5.1; save as UTF-8 with BOM)
 # - Collects "show interfaces <IF>" per interface from Cisco IOS/IOS-XE via SSH (Posh-SSH)
 # - Appends to .\logs\<host>\<IF>.txt with timestamp header
-# - No Port.txt/show.txt (legacy leftovers are removed on start)
-# - Auto-installs Posh-SSH (CurrentUser) if possible; also tries local .\modules\Posh-SSH
-# - Works on Windows PowerShell 5.1 and PowerShell 7
+# - No Port.txt/show.txt; legacy leftovers removed on start
+# - Online install allowed: uses only Install-Module (no PSRepository Register/Set/Get)
+# - Accepted args:
+#     -HostsFile <path>  -Username <name>  -PasswordFile <path> | -PasswordPlain <text>
+#     [-Repeat] [-IntervalMinutes <int>] [-RepeatCount <int>] [-DurationMinutes <int>]
+#     [-TimeoutSec <int>] [-VerboseLog] [-LogDir <path>]
+# - Compatibility guard: treats "-Name <x>" as "-Username <x>" to avoid common typo
 
-# ---- simple arg parser (supports: -HostsFile, -Username, -PasswordFile/-PasswordPlain, -Repeat, etc.) ----
+# ---------- pre: normalize console encoding (safe for 5.1) ----------
+try { $script:OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+
+# ---------- simple arg parser with alias fix ----------
+# convert common typos/aliases: -Name -> -Username, -User -> -Username
+$normalizedArgs = New-Object System.Collections.Generic.List[string]
+for ($i=0; $i -lt $args.Count; $i++) {
+  $a = [string]$args[$i]
+  if ($a -match '^[/-]') {
+    $k = $a.TrimStart('/','-').ToLower()
+    if ($k -eq 'name' -or $k -eq 'user') { $normalizedArgs.Add('-Username'); continue }
+  }
+  $normalizedArgs.Add($a)
+}
+
 $opt = @{
   HostsFile       = $null
   Username        = $null
@@ -19,41 +37,34 @@ $opt = @{
   TimeoutSec      = 300
   VerboseLog      = $false
 }
-for ($i=0; $i -lt $args.Count; $i++) {
-  $a = [string]$args[$i]
+for ($i=0; $i -lt $normalizedArgs.Count; $i++) {
+  $a = [string]$normalizedArgs[$i]
   if ($a -match '^[/-]') {
     $name = $a.TrimStart('/','-')
     switch -Regex ($name.ToLower()) {
-      'hostsfile'       { $i++; $opt.HostsFile       = $args[$i]; break }
-      'username'        { $i++; $opt.Username        = $args[$i]; break }
-      'passwordplain'   { $i++; $opt.PasswordPlain   = $args[$i]; break }
-      'passwordfile'    { $i++; $opt.PasswordFile    = $args[$i]; break }
-      'logdir'          { $i++; $opt.LogDir          = $args[$i]; break }
-      'repeat'          {        $opt.Repeat          = $true;     break }
-      'intervalminutes' { $i++; $opt.IntervalMinutes = [int]$args[$i]; break }
-      'repeatcount'     { $i++; $opt.RepeatCount     = [int]$args[$i]; break }
-      'durationminutes' { $i++; $opt.DurationMinutes = [int]$args[$i]; break }
-      'timeoutsec'      { $i++; $opt.TimeoutSec      = [int]$args[$i]; break }
-      'verboselog'      {        $opt.VerboseLog      = $true;     break }
+      'hostsfile'       { $i++; $opt.HostsFile       = $normalizedArgs[$i]; break }
+      'username'        { $i++; $opt.Username        = $normalizedArgs[$i]; break }
+      'passwordplain'   { $i++; $opt.PasswordPlain   = $normalizedArgs[$i]; break }
+      'passwordfile'    { $i++; $opt.PasswordFile    = $normalizedArgs[$i]; break }
+      'logdir'          { $i++; $opt.LogDir          = $normalizedArgs[$i]; break }
+      'repeat'          {        $opt.Repeat          = $true;                break }
+      'intervalminutes' { $i++; $opt.IntervalMinutes = [int]$normalizedArgs[$i]; break }
+      'repeatcount'     { $i++; $opt.RepeatCount     = [int]$normalizedArgs[$i]; break }
+      'durationminutes' { $i++; $opt.DurationMinutes = [int]$normalizedArgs[$i]; break }
+      'timeoutsec'      { $i++; $opt.TimeoutSec      = [int]$normalizedArgs[$i]; break }
+      'verboselog'      {        $opt.VerboseLog      = $true;                break }
       default           { }
     }
   }
 }
 
 function Write-Info($msg){ Write-Host ("[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $msg) }
-
 function Get-BaseDir {
   if ($PSScriptRoot) { return $PSScriptRoot }
   $p = $MyInvocation.MyCommand.Path
   if ($p) { return Split-Path -Parent $p }
   (Get-Location).Path
 }
-
-# Normalize console/file encoding a bit (safe for 5.1)
-try {
-  $script:OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-} catch {}
-
 $__BaseDir = Get-BaseDir
 if (-not $opt.LogDir -or $opt.LogDir.Trim() -eq "") { $opt.LogDir = Join-Path $__BaseDir 'logs' }
 
@@ -63,54 +74,15 @@ function Ensure-Folders([string]$PathToLog){
   }
 }
 
-# Try local modules\<Name> first, then PowerShellGet (CurrentUser)
+# ---------- online-friendly Ensure-Module (Install-Module only) ----------
 function Ensure-Module([string]$ModuleName, [Version]$MinVersion = [Version]"3.0.9"){
-  # local folder?
-  $localPath = Join-Path (Join-Path $__BaseDir 'modules') $ModuleName
-  if (Test-Path -LiteralPath $localPath) {
-    try {
-      Import-Module $localPath -Force -ErrorAction Stop
-      $m = Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1
-      if ($m -and $m.Version -ge $MinVersion) { return }
-    } catch {}
-  }
-  # already available?
-  $have = Get-Module -ListAvailable -Name $ModuleName | Where-Object { $_.Version -ge $MinVersion }
-  if ($have) {
-    Import-Module $ModuleName -Force -ErrorAction Stop
-    return
-  }
-  # try online install (CurrentUser)
-  if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
-    throw "Install-Module is not available. Please install PowerShellGet or place the module under .\modules\$ModuleName"
-  }
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-  $gallery = $null
-  try { $gallery = Get-PSRepository -ErrorAction Stop | Where-Object { $_.Name -eq 'PSGallery' } } catch {}
-  if (-not $gallery) {
-    try {
-      Register-PSRepository -Name 'PSGallery' `
-        -SourceLocation 'https://www.powershellgallery.com/api/v2' `
-        -ScriptSourceLocation 'https://www.powershellgallery.com/api/v2' `
-        -InstallationPolicy Trusted -ErrorAction Stop
-    } catch {
-      Write-Warning "Failed to register PSGallery (will still try install). $_"
+  $have = Get-Module -ListAvailable -Name $ModuleName | Where-Object { $_.Version -ge $MinVersion } | Sort-Object Version -Descending | Select-Object -First 1
+  if (-not $have) {
+    if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
+      throw "Install-Module is not available. Please install PowerShellGet or install ${ModuleName} manually."
     }
-  } else {
-    try {
-      if ($gallery.InstallationPolicy -ne 'Trusted') {
-        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-      }
-    } catch {}
-  }
-  try {
-    Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber -ErrorAction Stop
-  } catch {
-    try {
-      Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber -Repository PSGallery -ErrorAction Stop
-    } catch {
-      throw "Failed to install module ${ModuleName}: $($_.Exception.Message)"
-    }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    Install-Module -Name $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
   }
   Import-Module $ModuleName -Force -ErrorAction Stop
 }
@@ -211,7 +183,7 @@ function Collect-Target([string]$TargetHost,[int]$Port,[pscredential]$Credential
             -AcceptKey -ConnectionTimeout $TimeoutSec -ErrorAction Stop
     try {
       if ($VerboseLog) { Write-Info "shellstream start" }
-      # keep args minimal for older Posh-SSH
+      # minimal args for older Posh-SSH
       $shell = New-SSHShellStream -SessionId $sess.SessionId -TerminalName 'vt100'
 
       Start-Sleep -Milliseconds 200
@@ -257,14 +229,14 @@ function Cleanup-LegacyFiles([string]$BaseDir,[string]$LogsRoot){
   }
 }
 
-# ---- main ----
+# ---------- main ----------
 Ensure-Folders -PathToLog $opt.LogDir
 Cleanup-LegacyFiles -BaseDir $__BaseDir -LogsRoot $opt.LogDir
 
 if (-not $opt.HostsFile) { throw "Required: -HostsFile <path>" }
-if (-not $opt.Username)  { throw "Required: -Username <name>" }
+if (-not $opt.Username)  { throw "Required: -Username <name> (alias: -Name, -User)" }
 
-Ensure-Module  -ModuleName 'Posh-SSH'
+Ensure-Module -ModuleName 'Posh-SSH'
 
 $plain = Get-PlainPassword
 $secure = ConvertTo-SecureString $plain -AsPlainText -Force
