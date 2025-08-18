@@ -64,7 +64,6 @@ $OuRateRx = [regex]'(?i)\boutput rate\s+(?<bps>\d+)\s+bits/sec\b'
 # ---------- helpers ----------
 function Format-Bps([Nullable[int64]]$v){
   if ($null -eq $v) { return '' }
-  # v は bits/sec。SI単位で表示（1000倍系）
   if ($v -ge 1000000000) { return ('{0:N1} Gb/s' -f ($v / 1000000000.0)) }
   if ($v -ge 1000000)    { return ('{0:N1} Mb/s' -f ($v / 1000000.0)) }
   if ($v -ge 1000)       { return ('{0:N1} Kb/s' -f ($v / 1000.0)) }
@@ -85,9 +84,9 @@ function Parse-InterfaceFile([string]$path){
   $h = $HeaderRx.Matches($text)
   if ($h.Count -eq 0) { return $null }
 
-  $host = $h[0].Groups['host'].Value
-  $ifn  = $h[0].Groups['if'].Value
-  $port = [int]$h[0].Groups['port'].Value
+  $HostName = $h[0].Groups['host'].Value
+  $ifn      = $h[0].Groups['if'].Value
+  $port     = [int]$h[0].Groups['port'].Value
 
   $blocks = @()
   for ($i=0; $i -lt $h.Count; $i++){
@@ -132,7 +131,7 @@ function Parse-InterfaceFile([string]$path){
 
   [pscustomobject]@{
     FilePath      = $path
-    Host          = $host
+    Host          = $HostName
     Interface     = $ifn
     Port          = $port
     Captures      = $blocks.Count
@@ -170,14 +169,14 @@ foreach ($f in $ifFiles) {
 $errFiles = Get-ChildItem -LiteralPath $LogsRoot -Recurse -File -Filter '_errors_*.txt'
 $errRows = @()
 foreach ($ef in $errFiles) {
-  $host = Split-Path -Parent $ef.FullName | Split-Path -Leaf
+  $HostName = Split-Path -Parent $ef.FullName | Split-Path -Leaf
   $lines = Get-Content -LiteralPath $ef.FullName -ErrorAction SilentlyContinue
   $count = ($lines | Where-Object { $_ -match '\S' }).Count
   $last  = ($lines | Select-Object -Last 1)
   $ymd = [regex]::Match($ef.Name, '_errors_(\d{8})\.txt')
   $dateStr = if ($ymd.Success) { [datetime]::ParseExact($ymd.Groups[1].Value,'yyyyMMdd',$null).ToString('yyyy-MM-dd') } else { '' }
   $errRows += [pscustomobject]@{
-    Host = $host; Date=$dateStr; Lines=$count; LastLine=$last; FilePath=$ef.FullName
+    Host = $HostName; Date=$dateStr; Lines=$count; LastLine=$last; FilePath=$ef.FullName
   }
 }
 
@@ -264,7 +263,7 @@ $errTotal = ($errRows | Measure-Object -Property Lines -Sum).Sum
 [void]$sb.AppendLine("<div class='card'><div>Error Lines (all)</div><div class='num warn'>$errTotal</div></div>")
 [void]$sb.AppendLine("</div>")
 
-# Host scorecards
+# Device scorecards
 [void]$sb.AppendLine("<h2>Device Scorecard (by Host)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Total IFs</th><th>UP</th><th>DOWN</th><th>Admin Down</th></tr>")
 foreach($r in $byHost){
@@ -279,7 +278,7 @@ $topBusy = $busiest | Select-Object -First $opt.TopN
 $rank=0
 foreach($r in $topBusy){ $rank++
   $peakFmt = Format-Bps $r.Peak_bps
-  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape $peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Ecape $peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
