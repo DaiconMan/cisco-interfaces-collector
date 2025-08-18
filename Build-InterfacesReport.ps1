@@ -1,14 +1,14 @@
 # Build-InterfacesReport.ps1
 # - Scan .\logs\<host>\<IF>.txt and _errors_*.txt (produced by Get-CiscoInterfaces-PerIF.ps1)
-# - Output a single HTML report with easy-to-read summaries for non-network audiences
-# - PowerShell 5.1 compatible, no external modules, Japanese paths OK
+# - Output a single HTML report for non-network audiences
+# - PowerShell 5.1 compatible (no "??", no negative index, no 7.x-only syntax), no external modules
 
 # ---------- simple arg parser ----------
 $opt = @{
   LogsRoot   = $null
   OutFile    = $null
   TopN       = 10
-  ZeroBpsForUnused = 0     # 0 または少し余裕を見て 10~100 などに調整可能
+  ZeroBpsForUnused = 0
   Verbose    = $false
 }
 for ($i=0; $i -lt $args.Count; $i++) {
@@ -61,15 +61,25 @@ $SpeedRx  = [regex]'(?i),\s*(?<speed>\d+(?:\.\d+)?\s*(?:K|M|G)b/s)\b'
 $InRateRx = [regex]'(?i)\binput rate\s+(?<bps>\d+)\s+bits/sec\b'
 $OuRateRx = [regex]'(?i)\boutput rate\s+(?<bps>\d+)\s+bits/sec\b'
 
+# ---------- helpers ----------
 function Format-Bps([Nullable[int64]]$v){
   if ($null -eq $v) { return '' }
-  if ($v -ge 1GB) { return ('{0:N1} Gb/s' -f ($v / 1GB * 8)) }  # v は bits/sec の数値を想定。ここは見た目用なので bits→Gb/s 変換表記
-  if ($v -ge 1MB) { return ('{0:N1} Mb/s' -f ($v / 1MB * 8)) }
-  if ($v -ge 1KB) { return ('{0:N1} Kb/s' -f ($v / 1KB * 8)) }
+  # v は bits/sec。SI単位で表示（1000倍系）
+  if ($v -ge 1000000000) { return ('{0:N1} Gb/s' -f ($v / 1000000000.0)) }
+  if ($v -ge 1000000)    { return ('{0:N1} Mb/s' -f ($v / 1000000.0)) }
+  if ($v -ge 1000)       { return ('{0:N1} Kb/s' -f ($v / 1000.0)) }
   return ('{0} b/s' -f $v)
 }
+function NzInt64($x){ if ($null -eq $x) { return [int64]0 } else { return [int64]$x } }
 
-# ---------- parse a single interface file with block-by-block stats ----------
+function Html-Escape([string]$s){
+  if ($null -eq $s) { return '' }
+  try { return [System.Net.WebUtility]::HtmlEncode($s) } catch { 
+    try { return [System.Web.HttpUtility]::HtmlEncode($s) } catch { return $s }
+  }
+}
+
+# ---------- parse a single interface file ----------
 function Parse-InterfaceFile([string]$path){
   $text = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
   $h = $HeaderRx.Matches($text)
@@ -86,7 +96,6 @@ function Parse-InterfaceFile([string]$path){
     $body  = $text.Substring($start, $end - $start)
     $ts    = [datetimeoffset]::Parse($h[$i].Groups['ts'].Value)
 
-    # extract per-block
     $oper=''; $proto=''; $adminDown=$false
     $duplex=''; $speed=''; $inbps=$null; $outbps=$null
 
@@ -108,16 +117,16 @@ function Parse-InterfaceFile([string]$path){
     }
   }
 
-  # flap count (oper/proto が前回から変わった回数)
+  # flap count
   $flaps = 0
-  for ($i=1; $i -lt $blocks.Count; $i++){
-    if ($blocks[$i].Oper -ne $blocks[$i-1].Oper -or $blocks[$i].Proto -ne $blocks[$i-1].Proto){
+  for ($j=1; $j -lt $blocks.Count; $j++){
+    if ($blocks[$j].Oper -ne $blocks[$j-1].Oper -or $blocks[$j].Proto -ne $blocks[$j-1].Proto){
       $flaps++
     }
   }
 
-  # last & max
-  $last = $blocks[-1]
+  $lastIndex = $blocks.Count - 1
+  $last = $blocks[$lastIndex]
   $maxIn  = ($blocks | Measure-Object -Property In_bps -Maximum).Maximum
   $maxOut = ($blocks | Measure-Object -Property Out_bps -Maximum).Maximum
 
@@ -180,8 +189,8 @@ $admDownCount= ($ifs | Where-Object { $_.LastAdminDown }).Count
 
 $unused = $ifs | Where-Object {
   ($_.LastOper -eq 'down' -or $_.LastAdminDown) -and
-  (([int64]($_.LastIn_bps  ?? 0)) -le $opt.ZeroBpsForUnused) -and
-  (([int64]($_.LastOut_bps ?? 0)) -le $opt.ZeroBpsForUnused)
+  ( [int64](NzInt64 $_.LastIn_bps)  -le $opt.ZeroBpsForUnused ) -and
+  ( [int64](NzInt64 $_.LastOut_bps) -le $opt.ZeroBpsForUnused )
 }
 
 $halfOrLow = $ifs | Where-Object {
@@ -190,9 +199,11 @@ $halfOrLow = $ifs | Where-Object {
 
 $flappy = $ifs | Where-Object { $_.FlapCount -gt 0 } | Sort-Object FlapCount -Descending
 
-# busiest (by last max of in/out)
+# busiest (by latest peak)
 $busiest = $ifs | ForEach-Object {
-  $peak = [Math]::Max(($_.LastIn_bps ?? 0), ($_.LastOut_bps ?? 0))
+  $in  = NzInt64 $_.LastIn_bps
+  $out = NzInt64 $_.LastOut_bps
+  $peak = [Math]::Max($in,$out)
   $_ | Add-Member -PassThru NoteProperty Peak_bps $peak
 } | Sort-Object Peak_bps -Descending
 
@@ -224,7 +235,7 @@ body{font-family:Segoe UI,Meiryo,Arial,sans-serif;margin:24px;}
 h1{margin:0 0 8px 0}
 h2{margin:24px 0 8px 0;border-bottom:1px solid #ddd;padding-bottom:4px}
 .small{color:#666;font-size:12px}
-.kpi{display:flex;gap:12px;margin:12px 0}
+.kpi{display:flex;gap:12px;margin:12px 0;flex-wrap:wrap}
 .card{border:1px solid #e5e5e5;border-radius:8px;padding:12px;min-width:140px}
 .card .num{font-size:22px;font-weight:700}
 table{border-collapse:collapse;width:100%;margin:8px 0 16px 0}
@@ -236,14 +247,12 @@ th{background:#fafafa;text-align:left}
 .mono{font-family:Consolas,Menlo,monospace}
 '@
 
-function Html-Escape([string]$s){ if($null -eq $s){return ''} [System.Web.HttpUtility]::HtmlEncode($s) }
-
 $now = Get-Date
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('<!doctype html><html><head><meta charset="utf-8"><title>Cisco Interfaces Report</title>')
 [void]$sb.AppendLine("<style>$css</style></head><body>")
 [void]$sb.AppendLine("<h1>Cisco Interfaces Report</h1><div class='small'>Generated: $($now.ToString('yyyy-MM-dd HH:mm:ss zzz'))</div>")
-[void]$sb.AppendLine("<div class='small'>Source: $([System.Web.HttpUtility]::HtmlEncode($LogsRoot))</div>")
+[void]$sb.AppendLine("<div class='small'>Source: $([Html-Escape]$LogsRoot)</div>")
 
 # KPIs
 [void]$sb.AppendLine("<div class='kpi'>")
@@ -277,16 +286,16 @@ foreach($r in $topBusy){ $rank++
 # Unused candidates
 [void]$sb.AppendLine("<h2>Unused Candidates (DOWN/AdminDown & ≤ $($opt.ZeroBpsForUnused) bps)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Status</th><th>In (last)</th><th>Out (last)</th><th>Last Timestamp</th></tr>")
-foreach($r in $unused | Sort-Object Host,Interface){
+foreach($r in ($unused | Sort-Object Host,Interface)){
   $st = if ($r.LastAdminDown) { 'admin down' } else { $r.LastOper }
   [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td>$st</td><td>$([Html-Escape](Format-Bps $r.LastIn_bps))</td><td>$([Html-Escape](Format-Bps $r.LastOut_bps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
-# Half-duplex / Low speed
+# Duplex/Speed attention
 [void]$sb.AppendLine("<h2>Duplex/Speed Attention (Half duplex or ≤ 100Mb/s)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Duplex</th><th>Speed</th><th>Last Timestamp</th></tr>")
-foreach($r in $halfOrLow | Sort-Object Host,Interface){
+foreach($r in ($halfOrLow | Sort-Object Host,Interface)){
   [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td class='warn'>$([Html-Escape]$r.LastDuplex)</td><td class='warn'>$([Html-Escape]$r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
@@ -294,7 +303,7 @@ foreach($r in $halfOrLow | Sort-Object Host,Interface){
 # Flapping
 [void]$sb.AppendLine("<h2>Flap Suspects (state changes over time)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Flap Count</th><th>First Timestamp</th><th>Last Timestamp</th></tr>")
-foreach($r in $flappy | Select-Object -First $opt.TopN){
+foreach($r in ($flappy | Select-Object -First $opt.TopN)){
   [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td class='bad'>$($r.FlapCount)</td><td>$($r.FirstTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
