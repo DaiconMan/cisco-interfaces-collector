@@ -1,7 +1,7 @@
 # Build-InterfacesReport.ps1
 # - Scan .\logs\<host>\<IF>.txt and _errors_*.txt (produced by Get-CiscoInterfaces-PerIF.ps1)
 # - Output a single HTML report for non-network audiences
-# - PowerShell 5.1 compatible (no "??", no negative index, no 7.x-only syntax), no external modules
+# - PowerShell 5.1 compatible (no "??", no negative index), no external modules
 
 # ---------- simple arg parser ----------
 $opt = @{
@@ -74,7 +74,7 @@ function NzInt64($x){ if ($null -eq $x) { return [int64]0 } else { return [int64
 
 function Html-Escape([string]$s){
   if ($null -eq $s) { return '' }
-  try { return [System.Net.WebUtility]::HtmlEncode($s) } catch { 
+  try { return [System.Net.WebUtility]::HtmlEncode($s) } catch {
     try { return [System.Web.HttpUtility]::HtmlEncode($s) } catch { return $s }
   }
 }
@@ -189,8 +189,8 @@ $admDownCount= ($ifs | Where-Object { $_.LastAdminDown }).Count
 
 $unused = $ifs | Where-Object {
   ($_.LastOper -eq 'down' -or $_.LastAdminDown) -and
-  ( [int64](NzInt64 $_.LastIn_bps)  -le $opt.ZeroBpsForUnused ) -and
-  ( [int64](NzInt64 $_.LastOut_bps) -le $opt.ZeroBpsForUnused )
+  ( (NzInt64 $_.LastIn_bps)  -le $opt.ZeroBpsForUnused ) -and
+  ( (NzInt64 $_.LastOut_bps) -le $opt.ZeroBpsForUnused )
 }
 
 $halfOrLow = $ifs | Where-Object {
@@ -252,7 +252,7 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('<!doctype html><html><head><meta charset="utf-8"><title>Cisco Interfaces Report</title>')
 [void]$sb.AppendLine("<style>$css</style></head><body>")
 [void]$sb.AppendLine("<h1>Cisco Interfaces Report</h1><div class='small'>Generated: $($now.ToString('yyyy-MM-dd HH:mm:ss zzz'))</div>")
-[void]$sb.AppendLine("<div class='small'>Source: $([Html-Escape]$LogsRoot)</div>")
+[void]$sb.AppendLine("<div class='small'>Source: $(Html-Escape $LogsRoot)</div>")
 
 # KPIs
 [void]$sb.AppendLine("<div class='kpi'>")
@@ -268,7 +268,7 @@ $errTotal = ($errRows | Measure-Object -Property Lines -Sum).Sum
 [void]$sb.AppendLine("<h2>Device Scorecard (by Host)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Total IFs</th><th>UP</th><th>DOWN</th><th>Admin Down</th></tr>")
 foreach($r in $byHost){
-  [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td>$($r.IFs)</td><td class='good'>$($r.Up)</td><td class='bad'>$($r.Down)</td><td>$($r.AdminDown)</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td>$($r.IFs)</td><td class='good'>$($r.Up)</td><td class='bad'>$($r.Down)</td><td>$($r.AdminDown)</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -279,7 +279,7 @@ $topBusy = $busiest | Select-Object -First $opt.TopN
 $rank=0
 foreach($r in $topBusy){ $rank++
   $peakFmt = Format-Bps $r.Peak_bps
-  [void]$sb.AppendLine("<tr><td>$rank</td><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td>$([Html-Escape]$peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$rank</td><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$(Html-Escape $peakFmt)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -288,7 +288,7 @@ foreach($r in $topBusy){ $rank++
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Status</th><th>In (last)</th><th>Out (last)</th><th>Last Timestamp</th></tr>")
 foreach($r in ($unused | Sort-Object Host,Interface)){
   $st = if ($r.LastAdminDown) { 'admin down' } else { $r.LastOper }
-  [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td>$st</td><td>$([Html-Escape](Format-Bps $r.LastIn_bps))</td><td>$([Html-Escape](Format-Bps $r.LastOut_bps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td>$st</td><td>$(Html-Escape (Format-Bps $r.LastIn_bps))</td><td>$(Html-Escape (Format-Bps $r.LastOut_bps))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -296,7 +296,7 @@ foreach($r in ($unused | Sort-Object Host,Interface)){
 [void]$sb.AppendLine("<h2>Duplex/Speed Attention (Half duplex or ≤ 100Mb/s)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Duplex</th><th>Speed</th><th>Last Timestamp</th></tr>")
 foreach($r in ($halfOrLow | Sort-Object Host,Interface)){
-  [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td class='warn'>$([Html-Escape]$r.LastDuplex)</td><td class='warn'>$([Html-Escape]$r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -304,7 +304,7 @@ foreach($r in ($halfOrLow | Sort-Object Host,Interface)){
 [void]$sb.AppendLine("<h2>Flap Suspects (state changes over time)</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Flap Count</th><th>First Timestamp</th><th>Last Timestamp</th></tr>")
 foreach($r in ($flappy | Select-Object -First $opt.TopN)){
-  [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='mono'>$([Html-Escape]$r.Interface)</td><td class='bad'>$($r.FlapCount)</td><td>$($r.FirstTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='bad'>$($r.FlapCount)</td><td>$($r.FirstTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
@@ -312,7 +312,7 @@ foreach($r in ($flappy | Select-Object -First $opt.TopN)){
 [void]$sb.AppendLine("<h2>Error Files Summary</h2>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Total Lines</th><th>Files</th><th>Last Date</th></tr>")
 foreach($r in $errByHost){
-  [void]$sb.AppendLine("<tr><td>$([Html-Escape]$r.Host)</td><td class='warn'>$($r.Lines)</td><td>$($r.Files)</td><td>$([Html-Escape]$r.LastDate)</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='warn'>$($r.Lines)</td><td>$($r.Files)</td><td>$(Html-Escape $r.LastDate)</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
