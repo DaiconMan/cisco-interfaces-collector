@@ -16,7 +16,7 @@ rem 失敗時に画面を閉じない（1=有効/0=無効）
 set "DEBUG_HOLD=1"
 rem ======================================================================
 
-rem --- 文字コード（日本語コンソール用 / Shift-JIS）---
+rem --- 日本語コンソール向け（Shift-JIS） ---
 chcp 932 >nul 2>&1
 
 rem --- 実行ディレクトリへ移動（UNC/OneDrive でも pushd で安定） ---
@@ -28,30 +28,44 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem --- PowerShell 実行ファイルの検出（pwsh 優先） ---
-set "PS=pwsh.exe"
-where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
+rem --- 拡張子が無ければ .ps1 を付与（誤設定対策） ---
+for %%Z in ("%SCRIPT%") do (
+  set "EXT=%%~xZ"
+)
+if /I not "%EXT%"==".ps1" set "SCRIPT=%SCRIPT%.ps1"
+
+rem --- 絶対パスを解決（スペース/日本語/UNC 安定化） ---
+for %%I in ("%SCRIPT%")  do set "ABS_SCRIPT=%%~fI"
+for %%I in ("%HOSTS%")   do set "ABS_HOSTS=%%~fI"
+if exist "%PASSFILE%" (
+  for %%I in ("%PASSFILE%") do set "ABS_PASSFILE=%%~fI"
+) else (
+  set "ABS_PASSFILE="
+)
 
 rem --- 前提ファイル確認 ---
-if not exist "%SCRIPT%"  ( echo [ERROR] スクリプトが見つかりません: "%CD%\%SCRIPT%"  & goto :fail )
-if not exist "%HOSTS%"   ( echo [ERROR] hosts.txt が見つかりません: "%CD%\%HOSTS%"   & goto :fail )
+if not exist "%ABS_SCRIPT%" ( echo [ERROR] スクリプトが見つかりません: "%ABS_SCRIPT%" & goto :fail )
+if not exist "%ABS_HOSTS%"  ( echo [ERROR] hosts.txt が見つかりません: "%ABS_HOSTS%"  & goto :fail )
 
-if exist "%PASSFILE%" (
-  set "PWMSG=Password : file %CD%\%PASSFILE%"
+if defined ABS_PASSFILE (
+  set "PWMSG=Password : file %ABS_PASSFILE%"
 ) else (
   set "PWMSG=Password : prompt"
 )
 
-rem --- PowerShell 引数の組み立て（\" は使わない / フルパスで確実に） ---
-set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File ""%CD%\%SCRIPT%"" -HostsFile ""%CD%\%HOSTS%"" -Username ""%USERNAME%"""
-if exist "%PASSFILE%" set "PSARGS=%PSARGS% -PasswordFile ""%CD%\%PASSFILE%"""
-if "%REPEAT%"=="1"     set "PSARGS=%PSARGS% -Repeat -IntervalMinutes %INTERVAL_MIN%"
-if not "%DURATION_MIN%"=="0" set "PSARGS=%PSARGS% -DurationMinutes %DURATION_MIN%"
+rem --- 追加オプション（繰り返し） ---
+set "REPEAT_OPTS="
+if "%REPEAT%"=="1" set "REPEAT_OPTS=%REPEAT_OPTS% -Repeat -IntervalMinutes %INTERVAL_MIN%"
+if not "%DURATION_MIN%"=="0" set "REPEAT_OPTS=%REPEAT_OPTS% -DurationMinutes %DURATION_MIN%"
+
+rem --- PowerShell 実行ファイルの検出（pwsh 優先） ---
+set "PS=pwsh.exe"
+where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
 
 echo * 実行開始: %date% %time%
 echo   PS        : %PS%
-echo   Script    : %CD%\%SCRIPT%
-echo   Hosts     : %CD%\%HOSTS%
+echo   Script    : %ABS_SCRIPT%
+echo   Hosts     : %ABS_HOSTS%
 echo   Username  : %USERNAME%
 echo   %PWMSG%
 if "%REPEAT%"=="1" (
@@ -61,14 +75,23 @@ if "%REPEAT%"=="1" (
 )
 
 echo --- 実行コマンド ---
-echo %PS% %PSARGS%
+if defined ABS_PASSFILE (
+  echo "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -HostsFile "%ABS_HOSTS%" -Username "%USERNAME%" -PasswordFile "%ABS_PASSFILE%" %REPEAT_OPTS%
+) else (
+  echo "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -HostsFile "%ABS_HOSTS%" -Username "%USERNAME%" %REPEAT_OPTS%
+)
 echo --------------------
 
-"%PS%" %PSARGS%
+rem --- 実行（-File には必ず .ps1 の絶対パスを渡す） ---
+if defined ABS_PASSFILE (
+  "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -HostsFile "%ABS_HOSTS%" -Username "%USERNAME%" -PasswordFile "%ABS_PASSFILE%" %REPEAT_OPTS%
+) else (
+  "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" -HostsFile "%ABS_HOSTS%" -Username "%USERNAME%" %REPEAT_OPTS%
+)
+
 set "RC=%ERRORLEVEL%"
 echo * 終了コード: %RC%
 if not "%RC%"=="0" echo [ERROR] PowerShell スクリプトが異常終了しました。上のメッセージを確認してください.
-
 goto :end
 
 :fail
