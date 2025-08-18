@@ -1,3 +1,4 @@
+
 @echo off
 setlocal EnableExtensions
 
@@ -36,15 +37,15 @@ rem 前提確認
 if not exist "%ABS_SCRIPT%" ( echo [ERROR] スクリプトが見つかりません: "%ABS_SCRIPT%" & goto :fail )
 if not exist "%ABS_LOGS%"   ( echo [ERROR] ログフォルダが見つかりません: "%ABS_LOGS%"  & goto :fail )
 
-rem 追加オプションの組み立て
-set "OPTS=-LogsRoot ""%ABS_LOGS%"" -OutFile ""%ABS_OUT%"" -TopN %TOPN% -UnusedThreshold %UNUSED_THRESHOLD%"
-if "%VERBOSE%"=="1" set "OPTS=%OPTS% -Verbose"
-
 rem PowerShell 実行ファイルの検出（pwsh 優先）
 set "PS=pwsh.exe"
 where pwsh.exe >nul 2>&1 || set "PS=powershell.exe"
 
-echo * レポート生成開始: %date% %time%
+rem --- PowerShell 引数の組み立て（Run-Collector と同型／\" は使わない） ---
+set "PSARGS=-NoProfile -ExecutionPolicy Bypass -File ""%ABS_SCRIPT%"" -LogsRoot ""%ABS_LOGS%"" -OutFile ""%ABS_OUT%"" -TopN %TOPN% -UnusedThreshold %UNUSED_THRESHOLD%"
+if "%VERBOSE%"=="1" set "PSARGS=%PSARGS% -Verbose"
+
+echo * 実行開始: %date% %time%
 echo   PS       : %PS%
 echo   Script   : %ABS_SCRIPT%
 echo   LogsRoot : %ABS_LOGS%
@@ -53,11 +54,7 @@ echo   TopN     : %TOPN%
 echo   UnusedTh : %UNUSED_THRESHOLD%
 if "%VERBOSE%"=="1" echo   Verbose  : on
 
-echo --- 実行コマンド ---
-echo "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" %OPTS%
-echo --------------------
-
-"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%ABS_SCRIPT%" %OPTS%
+"%PS%" %PSARGS%
 set "RC=%ERRORLEVEL%"
 echo * 終了コード: %RC%
 if not "%RC%"=="0" echo [ERROR] 生成に失敗しました。上のメッセージを確認してください.
