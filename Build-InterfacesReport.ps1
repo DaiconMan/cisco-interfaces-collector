@@ -266,11 +266,14 @@ $busiest = $ifs | ForEach-Object {
   $_ | Add-Member -PassThru NoteProperty Peak_bps $peak
 } | Sort-Object Peak_bps -Descending
 
-# by utilization (need LinkBps)
+# by utilization (need LinkBps)  ← ★ inline if をやめて5.1互換に
 $byUtil = $ifs | Where-Object { $_.LinkBps -and ( $_.UtilIn_pct -ne $null -or $_.UtilOut_pct -ne $null ) } |
   ForEach-Object {
-    $u = [double][Math]::Max( (if ($_.UtilIn_pct -ne $null) { $_.UtilIn_pct } else { 0.0 }),
-                              (if ($_.UtilOut_pct -ne $null){ $_.UtilOut_pct} else { 0.0 }) )
+    $uIn  = 0.0
+    if ($_.UtilIn_pct -ne $null)  { $uIn  = [double]$_.UtilIn_pct }
+    $uOut = 0.0
+    if ($_.UtilOut_pct -ne $null) { $uOut = [double]$_.UtilOut_pct }
+    $u = [double][Math]::Max($uIn, $uOut)
     $_ | Add-Member -PassThru NoteProperty PeakUtil_pct $u
   } | Sort-Object PeakUtil_pct -Descending
 
@@ -349,7 +352,7 @@ foreach($r in $byHost){
 }
 [void]$sb.AppendLine("</table>")
 
-# NEW: Utilization & PPS details (from 5 minute rate)
+# Utilization & PPS details (from 5 minute rate)
 $topUtil = $byUtil | Select-Object -First $opt.TopN
 [void]$sb.AppendLine("<h2>Utilization & PPS (5-minute average)</h2>")
 [void]$sb.AppendLine("<div class='desc'>show interfaces の <b>5 minute input/output rate</b> から bps/pps とリンク速度を用いて利用率を算出。高い順に表示します。</div>")
@@ -384,7 +387,6 @@ foreach($r in $topPps){ $rank++
 [void]$sb.AppendLine("</table>")
 
 # Potential Performance Concerns
-# 条件: 高利用率 / 高PPS / Half-duplex / フラップ / エラーカウンタ
 $concerns = @()
 foreach($x in $ifs){
   $reasons = @()
@@ -443,16 +445,7 @@ foreach($r in ($unused | Sort-Object Host,Interface)){
 [void]$sb.AppendLine("<div class='desc'><b>Half-duplex</b> や <b>100Mb/s 以下</b>の速度表記のポート。設定不一致や古いリンクの可能性があります。</div>")
 [void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Duplex</th><th>Speed</th><th>Last Timestamp</th></tr>")
 foreach($r in ($halfOrLow | Sort-Object Host,Interface)){
-  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Ecape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
-}
-[void]$sb.AppendLine("</table>")
-
-# Flapping
-[void]$sb.AppendLine("<h2>Flap Suspects (state changes over time)</h2>")
-[void]$sb.AppendLine("<div class='desc'>取得履歴内で <b>UP/DOWN の状態が変化</b>した回数（Flap）があるポート。断続的な問題の兆候です。</div>")
-[void]$sb.AppendLine("<table><tr><th>Host</th><th>Interface</th><th>Flap Count</th><th>First Timestamp</th><th>Last Timestamp</th></tr>")
-foreach($r in ($flappy | Select-Object -First $opt.TopN)){
-  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='bad'>$($r.FlapCount)</td><td>$($r.FirstTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
+  [void]$sb.AppendLine("<tr><td>$(Html-Escape $r.Host)</td><td class='mono'>$(Html-Escape $r.Interface)</td><td class='warn'>$(Html-Escape $r.LastDuplex)</td><td class='warn'>$(Html-Escape $r.LastSpeed)</td><td>$($r.LastTs.ToString('yyyy-MM-dd HH:mm:ss zzz'))</td></tr>")
 }
 [void]$sb.AppendLine("</table>")
 
